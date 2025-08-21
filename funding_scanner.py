@@ -57,6 +57,51 @@ SESSION.headers.update({"User-Agent": USER_AGENT})
 # ------------------------------
 # Helpers
 # ------------------------------
+# ---------- Binance Top-N symbols (by 24h quote volume) ----------
+def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List[str]:
+    """
+    Возвращает список символов USDT‑perpetual (PERPETUAL, quoteAsset=USDT, TRADING)
+    отсортированный по 24h quoteVolume по убыванию и усечённый top_n.
+    """
+    try:
+        # 1) Список доступных перпетов
+        exinfo = SESSION.get(
+            "https://fapi.binance.com/fapi/v1/exchangeInfo",
+            timeout=DEFAULT_TIMEOUT
+        )
+        exinfo.raise_for_status()
+        info = exinfo.json()
+        perp_usdt = {
+            s["symbol"] for s in info.get("symbols", [])
+            if s.get("contractType") == "PERPETUAL"
+            and s.get("quoteAsset") == "USDT"
+            and s.get("status") == "TRADING"
+        }
+
+        # 2) 24h тикеры с объёмами
+        t24 = SESSION.get(
+            "https://fapi.binance.com/fapi/v1/ticker/24hr",
+            timeout=DEFAULT_TIMEOUT
+        )
+        t24.raise_for_status()
+        rows = t24.json()
+
+        # 3) Соединяем, фильтруем и сортируем
+        items = []
+        for r in rows:
+            sym = r.get("symbol")
+            if sym in perp_usdt:
+                qv = to_float(r.get("quoteVolume")) or 0.0
+                if qv >= float(min_quote_usdt):
+                    items.append((sym, qv))
+
+        items.sort(key=lambda x: x[1], reverse=True)
+        symbols = [sym for sym, _ in items[: int(top_n)]]
+        return symbols
+    except Exception as e:
+        logging.warning("binance_top_perp_usdt error: %s", e)
+        return []
+
 def utc_ms_now() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -299,10 +344,37 @@ def main():
     p.add_argument("--notify", action="store_true", help="Send Telegram messages")
     p.add_argument("--dry-run", action="store_true", help="Do not modify positions/log, just print/notify")
     p.add_argument("--debug", action="store_true", help="Verbose logging")
+    p.add_argument("--symbols-source", type=str, default=None, help="If 'binance-top', автоформирует список символов по объёму с Binance Futures.")
+    p.add_argument("--top-n", type=int, default=200, help="Сколько топ‑символов брать с Binance при --symbols-source binance-top (по умолчанию 200).")
+    p.add_argument("--min-quote-usdt", type=float, default=10000000, help="Минимальный 24h quoteVolume (USDT) при построении списка с Binance.")
+    p.add_argument("--save-symbols", type=str, default=None, help="Путь, куда сохранить финальный список символов (по одной строке).")
+
     args = p.parse_args()
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    symbols = [x.upper() for x in args.symbols]
+    exchanges = [x.lower() for x in args.exchanges]
+
+    # Автогенерация символов по объёму с Binance, если указано
+    if args.symbols_source and args.symbols_source.lower() == "binance-top":
+        logging.info("Building symbols from Binance top-%s by 24h quote volume (min %s USDT)...",
+                    args.top_n, args.min_quote_usdt)
+        symbols = binance_top_perp_usdt(top_n=args.top_n, min_quote_usdt=args.min_quote_usdt)
+        if not symbols:
+            logging.warning("Binance top list is empty; fallback to CLI --symbols.")
+            symbols = [x.upper() for x in args.symbols]
+        else:
+            logging.info("Got %d symbols. First 10: %s", len(symbols), " ".join(symbols[:10]))
+        if args.save_symbols:
+            try:
+                with open(args.save_symbols, "w") as f:
+                    for s in symbols:
+                        f.write(s + "\n")
+                logging.info("Saved symbols to %s", args.save_symbols)
+            except Exception as e:
+                logging.warning("save-symbols error: %s", e)
+
+        if args.debug:
+            logging.getLogger().setLevel(logging.DEBUG)
 
     # scan
     df = scan_all([x.lower() for x in args.exchanges], [x.upper() for x in args.symbols])
