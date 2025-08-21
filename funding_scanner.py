@@ -344,7 +344,7 @@ def main():
     p.add_argument("--notify", action="store_true", help="Send Telegram messages")
     p.add_argument("--dry-run", action="store_true", help="Do not modify positions/log, just print/notify")
     p.add_argument("--debug", action="store_true", help="Verbose logging")
-    p.add_argument("--symbols-source", type=str, default=None, help="If 'binance-top', автоформирует список символов по объёму с Binance Futures.")
+    p.add_argument("--symbols-source", type=str, default="binance-top", help="If 'binance-top', автоформирует список символов по объёму с Binance Futures.")
     p.add_argument("--top-n", type=int, default=200, help="Сколько топ‑символов брать с Binance при --symbols-source binance-top (по умолчанию 200).")
     p.add_argument("--min-quote-usdt", type=float, default=10000000, help="Минимальный 24h quoteVolume (USDT) при построении списка с Binance.")
     p.add_argument("--save-symbols", type=str, default=None, help="Путь, куда сохранить финальный список символов (по одной строке).")
@@ -377,7 +377,7 @@ def main():
             logging.getLogger().setLevel(logging.DEBUG)
 
     # scan
-    df = scan_all([x.lower() for x in args.exchanges], [x.upper() for x in args.symbols])
+    df = scan_all(exchanges, symbols)
 
     # raw logging
     if args.raw_csv:
@@ -483,7 +483,10 @@ def main():
             "entry_price": r["price"], "notional_usd": args.notional
         }
         if not args.dry_run:
-            positions = pd.concat([positions, pd.DataFrame([new_pos])], ignore_index=True)
+            if positions.empty:
+                positions = pd.DataFrame([new_pos], columns=["exchange","symbol","direction","entry_time_utc","entry_ts","entry_rate_8h","entry_apr_pct","entry_price","notional_usd"])
+            else:
+                positions = pd.concat([positions, pd.DataFrame([new_pos])], ignore_index=True)
 
         batch_logs.append({
             "time_utc": now_utc, "action":"OPEN",
