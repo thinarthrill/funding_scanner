@@ -57,7 +57,7 @@ import argparse
 import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
-
+import json
 # deps
 try:
     import requests
@@ -70,6 +70,7 @@ except Exception as e:
 GCS_AVAILABLE = False
 try:
     from google.cloud import storage  # type: ignore
+    from google.oauth2 import service_account  # type: ignore
     GCS_AVAILABLE = True
 except Exception:
     GCS_AVAILABLE = False
@@ -150,15 +151,40 @@ def gcs_split(gs_path: str):
     return bucket, blob
 
 def gcs_client():
+    """
+    Создаёт клиент GCS.
+    Приоритет:
+      1) GCS_KEY_JSON (однострочный JSON ключ сервис-аккаунта)
+      2) GOOGLE_APPLICATION_CREDENTIALS (путь к файлу JSON)
+      3) ADC (Workload Identity / gcloud auth)
+    """
     if not GCS_AVAILABLE:
         raise RuntimeError("google-cloud-storage is not installed. pip install google-cloud-storage")
+
+    key_str = os.getenv("GCS_KEY_JSON", "").strip()
+    if key_str:
+        try:
+            info = json.loads(key_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"❌ GCS_KEY_JSON is not valid JSON: {e}")
+        creds = service_account.Credentials.from_service_account_info(info)
+        return storage.Client(project=info.get("project_id"), credentials=creds)
+
+    # Если указан путь к файлу — стандартный путь
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip():
+        return storage.Client()
+
+    # ADC (напр. Workload Identity)
     return storage.Client()
 
 def gcs_read_csv(gs_path: str, expected_columns: List[str]) -> pd.DataFrame:
     try:
         client = gcs_client()
         bucket_name, blob_name = gcs_split(gs_path)
-        blob = client.bucket(bucket_name).blob(blob_name)
+        bucket = client.lookup_bucket(bucket_name)
+        if bucket is None:
+            raise FileNotFoundError(f"Bucket '{bucket_name}' not found or access denied")
+        blob = bucket.blob(blob_name)
         if not blob.exists():
             return pd.DataFrame(columns=expected_columns)
         data = blob.download_as_bytes()
@@ -175,7 +201,10 @@ def gcs_write_csv(gs_path: str, df: pd.DataFrame) -> None:
     try:
         client = gcs_client()
         bucket_name, blob_name = gcs_split(gs_path)
-        blob = client.bucket(bucket_name).blob(blob_name)
+        bucket = client.lookup_bucket(bucket_name)
+        if bucket is None:
+            raise FileNotFoundError(f"Bucket '{bucket_name}' not found or access denied")
+        blob = bucket.blob(blob_name)
         # write to bytes buffer
         from io import StringIO
         buf = StringIO()
@@ -567,7 +596,10 @@ def main():
                     buf.write("\n".join(symbols) + "\n")
                     client = gcs_client()
                     bucket, blob = gcs_split(save_symbols_path)
-                    client.bucket(bucket).blob(blob).upload_from_string(buf.getvalue(), content_type="text/plain")
+                    bkt = client.lookup_bucket(bucket)
+                    if bkt is None:
+                        raise FileNotFoundError(f"Bucket '{bucket}' not found or access denied")
+                    bkt.blob(blob).upload_from_string(buf.getvalue(), content_type="text/plain")
                 else:
                     with open(save_symbols_path, "w") as f:
                         for s in symbols: f.write(s+"\n")
