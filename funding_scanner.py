@@ -4,26 +4,25 @@
 Funding Signaler (env-driven, cron-friendly, GCS-aware)
 
 ENV (все необязательны, даны значения по умолчанию):
-
   # Биржи / символы
   EXCHANGES=binance,bybit,okx
   SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT
-  SYMBOLS_SOURCE=binance-top
+  SYMBOLS_SOURCE=binance-top           # или empty для ручного списка из SYMBOLS
   TOP_N=200
   MIN_QUOTE_USDT=10000000
   SAVE_SYMBOLS_PATH=gs://bucket/symbols_active.txt  # или локальный путь, либо пусто
 
   # Пороговые значения и режим удержания
-  ENTRY_APR=30
-  EXIT_APR=12
+  ENTRY_APR=30           # % для открытия
+  EXIT_APR=12            # % для закрытия
   MAX_HOLDING_H=48
 
   # Капитал / маржа / комиссии / заём / горизонт удержания
-  NOTIONAL=
+  NOTIONAL=              # если задан, переопределяет расчёт из CAPITAL/LEVERAGE
   CAPITAL=1000
   PERP_LEVERAGE=5
-  TAKER_FEE=0.0005
-  BORROW_APR=0.10
+  TAKER_FEE=0.0005       # 0.05%
+  BORROW_APR=0.10        # 10% годовых
   EXPECTED_HOLDING_H=24
 
   # Публикация в Телеграм
@@ -31,30 +30,29 @@ ENV (все необязательны, даны значения по умол�
   TELEGRAM_CHAT_ID=...
   TOP_N_TELEGRAM=3
 
-  # Ротация
-  ROTATE=true
-  ROTATE_DELTA_USD=0.5
+  # Ротация (держим одну позицию)
+  ROTATE=true            # true/false
+  ROTATE_DELTA_USD=0.5   # минимальное улучшение net/day ($/day) для ротации
 
   # Пути CSV (локально или GCS: gs://bucket/path.csv)
   RAW_CSV_PATH=
-  LOG_CSV_PATH=funding_scanner/signals_log.csv
-  POSITIONS_CSV_PATH=funding_scanner/positions.csv
-
-  # GCS
-  GCS_BUCKET=thinarthrill
-  # вариант 1: ключ как JSON-строка
-  GCS_KEY_JSON={"type":"service_account",...}
-  # вариант 2: GOOGLE_APPLICATION_CREDENTIALS может быть ПУТЁМ к файлу ИЛИ JSON-строкой
+  LOG_CSV_PATH=gs://bucket/funding/signals_log.csv
+  POSITIONS_CSV_PATH=gs://bucket/funding/positions.csv
 
   # Прочее
-  DEBUG=false
+  DEBUG=false            # true/false
   USER_AGENT=FundingSignaler/1.2
   REQUEST_TIMEOUT=12
+
+GCS доступ:
+  GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json  # или используйте ADC/Workload Identity
+
+Author: ChatGPT (GPT-5 Thinking)
+License: MIT
 """
 
 import os
 import sys
-import json
 import argparse
 import logging
 from typing import Dict, Any, List, Optional
@@ -68,8 +66,16 @@ except Exception as e:
     print("Install deps first: pip install requests pandas", file=sys.stderr)
     raise
 
+# google cloud storage (опционально)
+GCS_AVAILABLE = False
+try:
+    from google.cloud import storage  # type: ignore
+    GCS_AVAILABLE = True
+except Exception:
+    GCS_AVAILABLE = False
+
 # ------------------------------
-# Logging / ENV utils
+# Utils: ENV parsing
 # ------------------------------
 def getenv_str(key: str, default: str = "") -> str:
     v = os.getenv(key)
@@ -87,13 +93,19 @@ def getenv_bool(key: str, default: bool) -> bool:
     if v is None:
         return default
     v = v.strip().lower()
-    return v in ["1", "true", "yes", "y", "on"]
+    return v in ["1","true","yes","y","on"]
 
 def getenv_list(key: str, default_list: List[str]) -> List[str]:
     v = os.getenv(key)
     if v is None or v.strip() == "":
         return default_list
     return [x.strip() for x in v.split(",") if x.strip()]
+
+# ------------------------------
+# Config & logging
+# ------------------------------
+DEFAULT_EXCHANGES = ["binance", "bybit", "okx"]
+DEFAULT_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","BNBUSDT","AVAXUSDT","LINKUSDT","ADAUSDT","TONUSDT","OPUSDT","ARBUSDT","PEPEUSDT"]
 
 USER_AGENT = getenv_str("USER_AGENT", "FundingSignaler/1.2")
 REQUEST_TIMEOUT = int(getenv_float("REQUEST_TIMEOUT", 12))
@@ -106,89 +118,51 @@ logging.basicConfig(
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
 
+# --- tame noisy third-party loggers ---
+for noisy in ("urllib3", "requests.packages.urllib3", "aiohttp", "google"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+    logging.getLogger(noisy).propagate = False
+
+# --- add retries for transient HTTP errors ---
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+_retry = Retry(
+    total=3,
+    backoff_factor=0.3,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+    raise_on_status=False,
+)
+_adapter = HTTPAdapter(max_retries=_retry)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
+
 # ------------------------------
-# GCS helpers (инициализация по твоему паттерну)
+# GCS helpers
 # ------------------------------
-GCS_AVAILABLE = False
-try:
-    from google.cloud import storage  # type: ignore
-    GCS_AVAILABLE = True
-except Exception:
-    GCS_AVAILABLE = False
-
-_gcs_client: Optional["storage.Client"] = None
-
-def _init_gac_from_env_json() -> None:
-    """
-    Если GCS_KEY_JSON или GOOGLE_APPLICATION_CREDENTIALS содержит JSON-СТРОКУ,
-    сохраняем её во временный файл и выставляем GOOGLE_APPLICATION_CREDENTIALS=.../gcs_key.json
-    """
-    key_str = os.getenv("GCS_KEY_JSON") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if not key_str:
-        return
-    # если это путь к файлу — ничего не делаем
-    if not key_str.lstrip().startswith("{"):
-        return
-    try:
-        key_dict = json.loads(key_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"❌ Ошибка парсинга GCS_KEY_JSON/GOOGLE_APPLICATION_CREDENTIALS: {e}")
-    # пишем на диск
-    key_path = "gcs_key.json"
-    with open(key_path, "w", encoding="utf-8") as f:
-        json.dump(key_dict, f)
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
-    logging.info("✅ GOOGLE_APPLICATION_CREDENTIALS инициализирован через JSON‑строку -> gcs_key.json")
-
-def _get_gcs():
-    """
-    Единая точка получения клиента GCS, с ленивой инициализацией ключа из JSON‑строки.
-    """
-    global _gcs_client
-    if _gcs_client is not None:
-        return _gcs_client
-    if not GCS_AVAILABLE:
-        raise RuntimeError("google-cloud-storage не установлен. pip install google-cloud-storage")
-    _init_gac_from_env_json()
-    _gcs_client = storage.Client()
-    logging.info("✅ GCS клиент создан")
-    return _gcs_client
-
 def is_gs(path: Optional[str]) -> bool:
     return bool(path) and str(path).startswith("gs://")
 
 def gcs_split(gs_path: str):
+    # gs://bucket/path/to/file
     raw = gs_path[5:]
     bucket, _, blob = raw.partition("/")
     return bucket, blob
 
-def expand_storage_path(path: Optional[str]) -> Optional[str]:
-    """
-    Если путь НЕ начинается с gs:// и задан GCS_BUCKET — превращаем в gs://{bucket}/{path}.
-    Если пусто — возвращаем как есть.
-    """
-    if not path or path.strip() == "":
-        return path
-    if is_gs(path):
-        return path
-    bucket = getenv_str("GCS_BUCKET", "")
-    if bucket:
-        # убираем лидирующие слэши, чтобы не получить gs://bucket//...
-        key = path.lstrip("/")
-        return f"gs://{bucket}/{key}"
-    return path
+def gcs_client():
+    if not GCS_AVAILABLE:
+        raise RuntimeError("google-cloud-storage is not installed. pip install google-cloud-storage")
+    return storage.Client()
 
-# CSV <-> GCS
 def gcs_read_csv(gs_path: str, expected_columns: List[str]) -> pd.DataFrame:
     try:
-        client = _get_gcs()
+        client = gcs_client()
         bucket_name, blob_name = gcs_split(gs_path)
         blob = client.bucket(bucket_name).blob(blob_name)
         if not blob.exists():
             return pd.DataFrame(columns=expected_columns)
         data = blob.download_as_bytes()
-        from io import BytesIO
-        df = pd.read_csv(BytesIO(data))
+        df = pd.read_csv(pd.io.common.BytesIO(data))
         for c in expected_columns:
             if c not in df.columns:
                 df[c] = None
@@ -199,70 +173,30 @@ def gcs_read_csv(gs_path: str, expected_columns: List[str]) -> pd.DataFrame:
 
 def gcs_write_csv(gs_path: str, df: pd.DataFrame) -> None:
     try:
-        client = _get_gcs()
+        client = gcs_client()
         bucket_name, blob_name = gcs_split(gs_path)
         blob = client.bucket(bucket_name).blob(blob_name)
+        # write to bytes buffer
         from io import StringIO
         buf = StringIO()
         df.to_csv(buf, index=False)
-        blob.upload_from_string(buf.getvalue(), content_type="text/csv; charset=utf-8")
+        blob.upload_from_string(buf.getvalue(), content_type="text/csv")
     except Exception as e:
         logging.warning("GCS write error %s: %s", gs_path, e)
 
 def gcs_append_csv(gs_path: str, df: pd.DataFrame) -> None:
     if df is None or df.empty:
         return
+    # read old, concat, write new
     cols = list(df.columns)
-    existing = gcs_read_csv(gs_path, cols)
+    existing = gcs_read_csv(gs_path, cols) if is_gs(gs_path) else pd.DataFrame(columns=cols)
     out = pd.concat([existing, df], ignore_index=True)
     gcs_write_csv(gs_path, out)
 
-# Доп. утилиты из твоего шаблона (пригодятся, если захочешь хранить state.json)
-def gcs_blob_exists(bucket_name: str, key: str) -> bool:
-    client = _get_gcs()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(key)
-    return blob.exists()
-
-def gcs_load_json(default=None):
-    default = {} if default is None else default
-    bucket = getenv_str("GCS_BUCKET", "")
-    state_blob = getenv_str("GCS_STATE_BLOB", "spac/state.json")
-    if not bucket:
-        logging.debug("GCS_BUCKET не задан — возвращаю default JSON state.")
-        return default
-    try:
-        client = _get_gcs()
-        blob = client.bucket(bucket).blob(state_blob)
-        if not blob.exists():
-            logging.info(f"GCS: {state_blob} отсутствует — стартуем с пустого состояния.")
-            return default
-        data = blob.download_as_text(encoding="utf-8")
-        return json.loads(data)
-    except Exception as e:
-        logging.warning(f"GCS load error: {e} — возвращаю default.")
-        return default
-
-def gcs_save_json(obj: dict):
-    bucket = getenv_str("GCS_BUCKET", "")
-    state_blob = getenv_str("GCS_STATE_BLOB", "spac/state.json")
-    if not bucket:
-        logging.debug("GCS_BUCKET не задан — пропускаю сохранение JSON state.")
-        return
-    try:
-        client = _get_gcs()
-        blob = client.bucket(bucket).blob(state_blob)
-        payload = json.dumps(obj, ensure_ascii=False, indent=2)
-        blob.upload_from_string(payload, content_type="application/json; charset=utf-8")
-        logging.info(f"GCS: сохранено состояние {state_blob} ({len(payload)} байт).")
-    except Exception as e:
-        logging.error(f"GCS save error: {e}")
-
 # ------------------------------
-# Local/GCS I/O wrappers
+# Local I/O helpers
 # ------------------------------
 def read_csv(path: Optional[str], columns: List[str]) -> pd.DataFrame:
-    path = expand_storage_path(path)
     if not path or path.strip() == "":
         return pd.DataFrame(columns=columns)
     if is_gs(path):
@@ -279,7 +213,6 @@ def read_csv(path: Optional[str], columns: List[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=columns)
 
 def write_csv(path: Optional[str], df: pd.DataFrame) -> None:
-    path = expand_storage_path(path)
     if not path or path.strip() == "":
         return
     if is_gs(path):
@@ -290,7 +223,6 @@ def write_csv(path: Optional[str], df: pd.DataFrame) -> None:
     os.replace(tmp, path)
 
 def append_csv(path: Optional[str], df: pd.DataFrame) -> None:
-    path = expand_storage_path(path)
     if df is None or df.empty or not path or path.strip() == "":
         return
     if is_gs(path):
@@ -302,9 +234,6 @@ def append_csv(path: Optional[str], df: pd.DataFrame) -> None:
 # ------------------------------
 # Generic helpers
 # ------------------------------
-DEFAULT_EXCHANGES = ["binance", "bybit", "okx"]
-DEFAULT_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","BNBUSDT","AVAXUSDT","LINKUSDT","ADAUSDT","TONUSDT","OPUSDT","ARBUSDT","PEPEUSDT"]
-
 def utc_ms_now() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -389,7 +318,7 @@ def format_open_card(ex, sym, r, qty, nf, net_day_usd, gross_day_usd, fees_day_u
     ]
     return "\n".join(lines)
 
-# ---------- Binance Top-N symbols ----------
+# ---------- Binance Top-N symbols (by 24h quote volume) ----------
 def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List[str]:
     try:
         exinfo = SESSION.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT)
@@ -419,7 +348,7 @@ def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List
         return []
 
 # ------------------------------
-# Exchange clients
+# Exchange clients (public REST)
 # ------------------------------
 def binance_premium_index(symbol: str) -> Optional[Dict[str, Any]]:
     url = "https://fapi.binance.com/fapi/v1/premiumIndex"
@@ -443,6 +372,7 @@ def binance_premium_index(symbol: str) -> Optional[Dict[str, Any]]:
 
 def fetch_bybit_mark_price(symbol: str) -> Optional[float]:
     try:
+        # 1) tickers
         url = "https://api.bybit.com/v5/market/tickers"
         params = {"category": "linear", "symbol": symbol.upper()}
         r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
@@ -450,9 +380,22 @@ def fetch_bybit_mark_price(symbol: str) -> Optional[float]:
             j = r.json()
             rows = (j.get("result") or {}).get("list") or []
             if rows:
-                return to_float(rows[0].get("lastPrice"))
+                px = (to_float(rows[0].get("lastPrice"))
+                      or to_float(rows[0].get("markPrice"))
+                      or None)
+                if px:
+                    return px
+        # 2) fallback: mark-price kline close
+        mp = SESSION.get("https://api.bybit.com/v5/market/mark-price-kline",
+                         params={"category":"linear","symbol":symbol.upper(),"interval":"1","limit":1},
+                         timeout=REQUEST_TIMEOUT)
+        if mp.status_code == 200:
+            jm = mp.json()
+            rows = (jm.get("result") or {}).get("list") or []
+            if rows and len(rows[0]) >= 5:
+                return to_float(rows[0][4])  # close
     except Exception as e:
-        logging.debug("Bybit price error %s: %s", symbol, e)
+        logging.debug("Bybit price fallback error %s: %s", symbol, e)
     return None
 
 def bybit_latest_funding(symbol: str) -> Optional[Dict[str, Any]]:
@@ -547,7 +490,7 @@ def scan_all(exchanges: List[str], symbols: List[str]) -> pd.DataFrame:
                 row = bybit_latest_funding(sym)
             elif ex == "okx":
                 row = okx_funding(sym)
-            if not row:
+            if not row: 
                 continue
             r8 = row.get("rate_8h")
             apr = annualize_from_8h(r8) if r8 is not None else None
@@ -564,13 +507,15 @@ def scan_all(exchanges: List[str], symbols: List[str]) -> pd.DataFrame:
 # Main
 # ------------------------------
 def main():
+    # аргументы CLI оставлены для совместимости, но всё берём из ENV
     ap = argparse.ArgumentParser()
     ap.add_argument("--noop", action="store_true", help="No-op, everything via ENV")
     ap.parse_args()
 
-    exchanges = [x.lower() for x in getenv_list("EXCHANGES", ["binance","bybit","okx"])]
+    # ENV -> настройки
+    exchanges = [x.lower() for x in getenv_list("EXCHANGES", DEFAULT_EXCHANGES)]
     symbols_source = getenv_str("SYMBOLS_SOURCE", "binance-top").lower()
-    symbols = [x.upper() for x in getenv_list("SYMBOLS", ["BTCUSDT","ETHUSDT","SOLUSDT"])]
+    symbols = [x.upper() for x in getenv_list("SYMBOLS", DEFAULT_SYMBOLS)]
     top_n = int(getenv_float("TOP_N", 200))
     min_quote_usdt = float(getenv_float("MIN_QUOTE_USDT", 10_000_000))
     save_symbols_path = getenv_str("SAVE_SYMBOLS_PATH", "")
@@ -586,6 +531,10 @@ def main():
     taker_fee = float(getenv_float("TAKER_FEE", 0.0005))
     borrow_apr = float(getenv_float("BORROW_APR", 0.10))
     expected_holding_h = float(getenv_float("EXPECTED_HOLDING_H", 24.0))
+
+    # additional filters
+    MIN_NET_DAY_USD = float(getenv_float("MIN_NET_DAY_USD", 0.0))
+    MIN_PRICE = float(getenv_float("MIN_PRICE", 0.0))
 
     top_n_tg = int(getenv_float("TOP_N_TELEGRAM", 3))
     rotate = getenv_bool("ROTATE", False)
@@ -611,20 +560,18 @@ def main():
         logging.info("Got %d symbols. First 10: %s", len(symbols), " ".join(symbols[:10]))
         if save_symbols_path:
             try:
-                out_path = expand_storage_path(save_symbols_path)
-                if is_gs(out_path):
+                # запишем список в локальный или GCS путь
+                if is_gs(save_symbols_path):
                     from io import StringIO
                     buf = StringIO()
                     buf.write("\n".join(symbols) + "\n")
-                    client = _get_gcs()
-                    bucket, blob = gcs_split(out_path)
-                    client.bucket(bucket).blob(blob).upload_from_string(buf.getvalue(), content_type="text/plain; charset=utf-8")
+                    client = gcs_client()
+                    bucket, blob = gcs_split(save_symbols_path)
+                    client.bucket(bucket).blob(blob).upload_from_string(buf.getvalue(), content_type="text/plain")
                 else:
-                    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-                    with open(out_path, "w") as f:
-                        for s in symbols:
-                            f.write(s + "\n")
-                logging.info("Saved symbols to %s", out_path)
+                    with open(save_symbols_path, "w") as f:
+                        for s in symbols: f.write(s+"\n")
+                logging.info("Saved symbols to %s", save_symbols_path)
             except Exception as e:
                 logging.warning("save-symbols error: %s", e)
 
@@ -653,6 +600,9 @@ def main():
     df["fees_day_usd"]  = fees_day
     df["borrow_day_usd"] = borrow_day
     df["net_day_usd"]   = net_day
+
+    # filter bad/illiquid prices early
+    df = df[(~df["price"].isna()) & (df["price"] >= MIN_PRICE)]
 
     # сырые логи скана
     if raw_csv_path:
@@ -720,13 +670,18 @@ def main():
 
     # Кандидаты по net/day
     candidates = df.copy()
-    candidates = candidates[candidates["apr_pct"].abs() >= entry_apr]
+    candidates = candidates[
+        (candidates["apr_pct"].abs() >= entry_apr) &
+        (candidates["net_day_usd"] > MIN_NET_DAY_USD)
+    ]
     candidates = candidates.sort_values("net_day_usd", ascending=False)
 
-    # TOP‑N в канал
+    # TOP‑N в канал (без дублирования лучшего)
     if top_n_tg > 0 and not candidates.empty:
         publish_rows = candidates.iloc[1:1+top_n_tg] if len(candidates) > 1 else pd.DataFrame(columns=candidates.columns)
         for _, r in publish_rows.iterrows():
+            if r["price"] is None or r["price"] < MIN_PRICE:
+                continue
             qty = hedge_qty(eff_notional, r["price"])
             nf = r.get("next_funding_utc") or "n/a"
             card = format_open_card(r["exchange"], r["symbol"], r, qty, nf,
@@ -759,7 +714,7 @@ def main():
                 else:
                     need_open = False
 
-        if need_open:
+        if need_open and (r["price"] is not None) and (r["price"] >= MIN_PRICE):
             entry_qty = hedge_qty(eff_notional, r["price"])
             payout8 = payout_8h_usd(r["rate_8h"], eff_notional)
             payoutd = r["gross_day_usd"]
