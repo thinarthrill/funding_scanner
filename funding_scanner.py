@@ -58,6 +58,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 import json
+import hmac, hashlib, time
 # deps
 try:
     import requests
@@ -74,6 +75,45 @@ try:
     GCS_AVAILABLE = True
 except Exception:
     GCS_AVAILABLE = False
+
+def bybit_get_fee(symbol: str) -> Optional[float]:
+    """
+    Возвращает takerFeeRate для symbol на Bybit (linear contracts).
+    """
+    try:
+        api_key = os.getenv("BYBIT_API_KEY", "")
+        api_secret = os.getenv("BYBIT_API_SECRET", "")
+        if not api_key or not api_secret:
+            logging.debug("Bybit API key/secret не заданы, fallback на TAKER_FEE из ENV")
+            return None
+
+        url = "https://api.bybit.com/v5/account/fee-rate"
+        params = {"category": "linear", "symbol": symbol.upper()}
+
+        ts = str(int(time.time() * 1000))
+        param_str = "&".join([f"{k}={v}" for k,v in sorted(params.items())])
+        sign_str = ts + api_key + "5000" + param_str  # recv_window=5000 по умолчанию
+        signature = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+
+        headers = {
+            "X-BAPI-API-KEY": api_key,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-SIGN-TYPE": "2",
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": "5000",
+        }
+
+        r = SESSION.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        j = r.json()
+        if j.get("retCode") == 0:
+            fee_str = j["result"]["list"][0]["takerFeeRate"]
+            return float(fee_str)
+        else:
+            logging.warning("Bybit fee API error: %s", j)
+            return None
+    except Exception as e:
+        logging.warning("Bybit fee API exception: %s", e)
+        return None
 
 # ------------------------------
 # Utils: ENV parsing
@@ -558,6 +598,17 @@ def main():
     capital = float(getenv_float("CAPITAL", 1000.0))
     perp_leverage = float(getenv_float("PERP_LEVERAGE", 5.0))
     taker_fee = float(getenv_float("TAKER_FEE", 0.0005))
+
+    # если на bybit и есть API-ключи — подтянуть реальную комиссию
+    if "bybit" in exchanges:
+        try:
+            f = bybit_get_fee("BTCUSDT")   # можно динамически по каждому symbol
+            if f:
+                taker_fee = f
+                logging.info("Bybit taker fee auto-set to %s", taker_fee)
+        except Exception as e:
+            logging.warning("Bybit auto-fee failed: %s", e)
+
     borrow_apr = float(getenv_float("BORROW_APR", 0.10))
     expected_holding_h = float(getenv_float("EXPECTED_HOLDING_H", 24.0))
 
