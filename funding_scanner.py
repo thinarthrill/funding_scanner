@@ -1,23 +1,64 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Funding Signaler (cron-friendly, single-run):
-- Scans perpetual funding on Binance, Bybit, OKX
-- Opens/closes delta-neutral hedge signals based on APR thresholds
-- Keeps state in CSV files (positions, signals log)
-- Optional Telegram notifications
-- Designed to be run every 15 minutes by cron/Render
+Funding Signaler (env-driven, cron-friendly, GCS-aware)
 
-Author: ChatGPT (GPT-5 Thinking)
-License: MIT
+ENV (все необязательны, даны значения по умолчанию):
+
+  # Биржи / символы
+  EXCHANGES=binance,bybit,okx
+  SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT
+  SYMBOLS_SOURCE=binance-top
+  TOP_N=200
+  MIN_QUOTE_USDT=10000000
+  SAVE_SYMBOLS_PATH=gs://bucket/symbols_active.txt  # или локальный путь, либо пусто
+
+  # Пороговые значения и режим удержания
+  ENTRY_APR=30
+  EXIT_APR=12
+  MAX_HOLDING_H=48
+
+  # Капитал / маржа / комиссии / заём / горизонт удержания
+  NOTIONAL=
+  CAPITAL=1000
+  PERP_LEVERAGE=5
+  TAKER_FEE=0.0005
+  BORROW_APR=0.10
+  EXPECTED_HOLDING_H=24
+
+  # Публикация в Телеграм
+  TELEGRAM_BOT_TOKEN=...
+  TELEGRAM_CHAT_ID=...
+  TOP_N_TELEGRAM=3
+
+  # Ротация
+  ROTATE=true
+  ROTATE_DELTA_USD=0.5
+
+  # Пути CSV (локально или GCS: gs://bucket/path.csv)
+  RAW_CSV_PATH=
+  LOG_CSV_PATH=funding_scanner/signals_log.csv
+  POSITIONS_CSV_PATH=funding_scanner/positions.csv
+
+  # GCS
+  GCS_BUCKET=thinarthrill
+  # вариант 1: ключ как JSON-строка
+  GCS_KEY_JSON={"type":"service_account",...}
+  # вариант 2: GOOGLE_APPLICATION_CREDENTIALS может быть ПУТЁМ к файлу ИЛИ JSON-строкой
+
+  # Прочее
+  DEBUG=false
+  USER_AGENT=FundingSignaler/1.2
+  REQUEST_TIMEOUT=12
 """
+
 import os
 import sys
-import time
+import json
 import argparse
 import logging
-from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
+from datetime import datetime, timezone
 
 # deps
 try:
@@ -28,26 +69,37 @@ except Exception as e:
     raise
 
 # ------------------------------
-# Config & logging
+# Logging / ENV utils
 # ------------------------------
-DEFAULT_EXCHANGES = ["binance", "bybit", "okx"]
-DEFAULT_SYMBOLS = [
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","BNBUSDT",
-    "AVAXUSDT","LINKUSDT","ADAUSDT","TONUSDT","OPUSDT","ARBUSDT","PEPEUSDT","JELLYJELLYUSDT",
-    "OGNUSDT", "CUDISUSDT","AGTUSDT","MELANIAUSDT"
-]
-DEFAULT_ENTRY_APR = 15.0     # % APR to OPEN
-DEFAULT_EXIT_APR  = 8.0      # % APR to CLOSE
-DEFAULT_MAX_HOLD_H = 48       # force close after N hours
-DEFAULT_NOTIONAL = None       # e.g. 10000 to estimate payouts
-DEFAULT_RAW_CSV = None
-DEFAULT_LOG_CSV = "signals_log.csv"
-DEFAULT_POS_CSV = "positions.csv"
-DEFAULT_TIMEOUT = 12
-USER_AGENT = "FundingSignaler/1.0"
+def getenv_str(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    return default if v is None or v.strip() == "" else v.strip()
+
+def getenv_float(key: str, default: float) -> float:
+    v = os.getenv(key)
+    try:
+        return float(v) if v is not None and v.strip() != "" else default
+    except Exception:
+        return default
+
+def getenv_bool(key: str, default: bool) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    return v in ["1", "true", "yes", "y", "on"]
+
+def getenv_list(key: str, default_list: List[str]) -> List[str]:
+    v = os.getenv(key)
+    if v is None or v.strip() == "":
+        return default_list
+    return [x.strip() for x in v.split(",") if x.strip()]
+
+USER_AGENT = getenv_str("USER_AGENT", "FundingSignaler/1.2")
+REQUEST_TIMEOUT = int(getenv_float("REQUEST_TIMEOUT", 12))
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if getenv_bool("DEBUG", False) else logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -55,66 +107,215 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
 
 # ------------------------------
-# Helpers
+# GCS helpers (инициализация по твоему паттерну)
 # ------------------------------
-# ---------- Binance Top-N symbols (by 24h quote volume) ----------
-def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List[str]:
+GCS_AVAILABLE = False
+try:
+    from google.cloud import storage  # type: ignore
+    GCS_AVAILABLE = True
+except Exception:
+    GCS_AVAILABLE = False
+
+_gcs_client: Optional["storage.Client"] = None
+
+def _init_gac_from_env_json() -> None:
     """
-    Возвращает список символов USDT‑perpetual (PERPETUAL, quoteAsset=USDT, TRADING)
-    отсортированный по 24h quoteVolume по убыванию и усечённый top_n.
+    Если GCS_KEY_JSON или GOOGLE_APPLICATION_CREDENTIALS содержит JSON-СТРОКУ,
+    сохраняем её во временный файл и выставляем GOOGLE_APPLICATION_CREDENTIALS=.../gcs_key.json
     """
+    key_str = os.getenv("GCS_KEY_JSON") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if not key_str:
+        return
+    # если это путь к файлу — ничего не делаем
+    if not key_str.lstrip().startswith("{"):
+        return
     try:
-        # 1) Список доступных перпетов
-        exinfo = SESSION.get(
-            "https://fapi.binance.com/fapi/v1/exchangeInfo",
-            timeout=DEFAULT_TIMEOUT
-        )
-        exinfo.raise_for_status()
-        info = exinfo.json()
-        perp_usdt = {
-            s["symbol"] for s in info.get("symbols", [])
-            if s.get("contractType") == "PERPETUAL"
-            and s.get("quoteAsset") == "USDT"
-            and s.get("status") == "TRADING"
-        }
+        key_dict = json.loads(key_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"❌ Ошибка парсинга GCS_KEY_JSON/GOOGLE_APPLICATION_CREDENTIALS: {e}")
+    # пишем на диск
+    key_path = "gcs_key.json"
+    with open(key_path, "w", encoding="utf-8") as f:
+        json.dump(key_dict, f)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
+    logging.info("✅ GOOGLE_APPLICATION_CREDENTIALS инициализирован через JSON‑строку -> gcs_key.json")
 
-        # 2) 24h тикеры с объёмами
-        t24 = SESSION.get(
-            "https://fapi.binance.com/fapi/v1/ticker/24hr",
-            timeout=DEFAULT_TIMEOUT
-        )
-        t24.raise_for_status()
-        rows = t24.json()
+def _get_gcs():
+    """
+    Единая точка получения клиента GCS, с ленивой инициализацией ключа из JSON‑строки.
+    """
+    global _gcs_client
+    if _gcs_client is not None:
+        return _gcs_client
+    if not GCS_AVAILABLE:
+        raise RuntimeError("google-cloud-storage не установлен. pip install google-cloud-storage")
+    _init_gac_from_env_json()
+    _gcs_client = storage.Client()
+    logging.info("✅ GCS клиент создан")
+    return _gcs_client
 
-        # 3) Соединяем, фильтруем и сортируем
-        items = []
-        for r in rows:
-            sym = r.get("symbol")
-            if sym in perp_usdt:
-                qv = to_float(r.get("quoteVolume")) or 0.0
-                if qv >= float(min_quote_usdt):
-                    items.append((sym, qv))
+def is_gs(path: Optional[str]) -> bool:
+    return bool(path) and str(path).startswith("gs://")
 
-        items.sort(key=lambda x: x[1], reverse=True)
-        symbols = [sym for sym, _ in items[: int(top_n)]]
-        return symbols
+def gcs_split(gs_path: str):
+    raw = gs_path[5:]
+    bucket, _, blob = raw.partition("/")
+    return bucket, blob
+
+def expand_storage_path(path: Optional[str]) -> Optional[str]:
+    """
+    Если путь НЕ начинается с gs:// и задан GCS_BUCKET — превращаем в gs://{bucket}/{path}.
+    Если пусто — возвращаем как есть.
+    """
+    if not path or path.strip() == "":
+        return path
+    if is_gs(path):
+        return path
+    bucket = getenv_str("GCS_BUCKET", "")
+    if bucket:
+        # убираем лидирующие слэши, чтобы не получить gs://bucket//...
+        key = path.lstrip("/")
+        return f"gs://{bucket}/{key}"
+    return path
+
+# CSV <-> GCS
+def gcs_read_csv(gs_path: str, expected_columns: List[str]) -> pd.DataFrame:
+    try:
+        client = _get_gcs()
+        bucket_name, blob_name = gcs_split(gs_path)
+        blob = client.bucket(bucket_name).blob(blob_name)
+        if not blob.exists():
+            return pd.DataFrame(columns=expected_columns)
+        data = blob.download_as_bytes()
+        from io import BytesIO
+        df = pd.read_csv(BytesIO(data))
+        for c in expected_columns:
+            if c not in df.columns:
+                df[c] = None
+        return df[expected_columns]
     except Exception as e:
-        logging.warning("binance_top_perp_usdt error: %s", e)
-        return []
+        logging.warning("GCS read error %s: %s", gs_path, e)
+        return pd.DataFrame(columns=expected_columns)
+
+def gcs_write_csv(gs_path: str, df: pd.DataFrame) -> None:
+    try:
+        client = _get_gcs()
+        bucket_name, blob_name = gcs_split(gs_path)
+        blob = client.bucket(bucket_name).blob(blob_name)
+        from io import StringIO
+        buf = StringIO()
+        df.to_csv(buf, index=False)
+        blob.upload_from_string(buf.getvalue(), content_type="text/csv; charset=utf-8")
+    except Exception as e:
+        logging.warning("GCS write error %s: %s", gs_path, e)
+
+def gcs_append_csv(gs_path: str, df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        return
+    cols = list(df.columns)
+    existing = gcs_read_csv(gs_path, cols)
+    out = pd.concat([existing, df], ignore_index=True)
+    gcs_write_csv(gs_path, out)
+
+# Доп. утилиты из твоего шаблона (пригодятся, если захочешь хранить state.json)
+def gcs_blob_exists(bucket_name: str, key: str) -> bool:
+    client = _get_gcs()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(key)
+    return blob.exists()
+
+def gcs_load_json(default=None):
+    default = {} if default is None else default
+    bucket = getenv_str("GCS_BUCKET", "")
+    state_blob = getenv_str("GCS_STATE_BLOB", "spac/state.json")
+    if not bucket:
+        logging.debug("GCS_BUCKET не задан — возвращаю default JSON state.")
+        return default
+    try:
+        client = _get_gcs()
+        blob = client.bucket(bucket).blob(state_blob)
+        if not blob.exists():
+            logging.info(f"GCS: {state_blob} отсутствует — стартуем с пустого состояния.")
+            return default
+        data = blob.download_as_text(encoding="utf-8")
+        return json.loads(data)
+    except Exception as e:
+        logging.warning(f"GCS load error: {e} — возвращаю default.")
+        return default
+
+def gcs_save_json(obj: dict):
+    bucket = getenv_str("GCS_BUCKET", "")
+    state_blob = getenv_str("GCS_STATE_BLOB", "spac/state.json")
+    if not bucket:
+        logging.debug("GCS_BUCKET не задан — пропускаю сохранение JSON state.")
+        return
+    try:
+        client = _get_gcs()
+        blob = client.bucket(bucket).blob(state_blob)
+        payload = json.dumps(obj, ensure_ascii=False, indent=2)
+        blob.upload_from_string(payload, content_type="application/json; charset=utf-8")
+        logging.info(f"GCS: сохранено состояние {state_blob} ({len(payload)} байт).")
+    except Exception as e:
+        logging.error(f"GCS save error: {e}")
+
+# ------------------------------
+# Local/GCS I/O wrappers
+# ------------------------------
+def read_csv(path: Optional[str], columns: List[str]) -> pd.DataFrame:
+    path = expand_storage_path(path)
+    if not path or path.strip() == "":
+        return pd.DataFrame(columns=columns)
+    if is_gs(path):
+        return gcs_read_csv(path, columns)
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=columns)
+    try:
+        df = pd.read_csv(path)
+        for c in columns:
+            if c not in df.columns:
+                df[c] = None
+        return df[columns]
+    except Exception:
+        return pd.DataFrame(columns=columns)
+
+def write_csv(path: Optional[str], df: pd.DataFrame) -> None:
+    path = expand_storage_path(path)
+    if not path or path.strip() == "":
+        return
+    if is_gs(path):
+        gcs_write_csv(path, df)
+        return
+    tmp = f"{path}.tmp"
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+def append_csv(path: Optional[str], df: pd.DataFrame) -> None:
+    path = expand_storage_path(path)
+    if df is None or df.empty or not path or path.strip() == "":
+        return
+    if is_gs(path):
+        gcs_append_csv(path, df)
+        return
+    header = not os.path.exists(path)
+    df.to_csv(path, mode="a", header=header, index=False)
+
+# ------------------------------
+# Generic helpers
+# ------------------------------
+DEFAULT_EXCHANGES = ["binance", "bybit", "okx"]
+DEFAULT_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","BNBUSDT","AVAXUSDT","LINKUSDT","ADAUSDT","TONUSDT","OPUSDT","ARBUSDT","PEPEUSDT"]
 
 def utc_ms_now() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 def to_float(x) -> Optional[float]:
     try:
-        if x is None:
-            return None
+        if x is None: return None
         return float(x)
     except Exception:
         return None
 
 def annualize_from_8h(rate_8h: float) -> float:
-    # simple APR (fraction), 3 periods per day * 365
     return rate_8h * 3 * 365
 
 def fmt_ts(ms: Optional[int]) -> Optional[str]:
@@ -126,20 +327,20 @@ def fmt_ts(ms: Optional[int]) -> Optional[str]:
 
 def suggestion_from_rate(rate_8h: Optional[float]) -> str:
     if rate_8h is None: return "n/a"
-    if rate_8h > 0: return "SHORT_PERP_LONG_SPOT"  # shorts receive funding
-    if rate_8h < 0: return "LONG_PERP_SHORT_SPOT"  # longs receive funding
+    if rate_8h > 0: return "SHORT_PERP_LONG_SPOT"
+    if rate_8h < 0: return "LONG_PERP_SHORT_SPOT"
     return "NEUTRAL"
 
 def maybe_send_telegram(text: str) -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    token = getenv_str("TELEGRAM_BOT_TOKEN", "")
+    chat_id = getenv_str("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
         logging.debug("Telegram not configured")
         return
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True, "parse_mode": "HTML"}
-        r = SESSION.post(url, json=payload, timeout=DEFAULT_TIMEOUT)
+        r = SESSION.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
             logging.warning("Telegram send failed: %s %s", r.status_code, r.text[:200])
     except Exception as e:
@@ -160,13 +361,70 @@ def payout_day_usd(rate_8h: Optional[float], notional: Optional[float]) -> Optio
         return None
     return round(3 * rate_8h * float(notional), 4)
 
+def leg_notional_from_capital(capital_usd: float, perp_leverage: float) -> float:
+    if perp_leverage <= 0:
+        return max(0.0, float(capital_usd))
+    return float(capital_usd) / (1.0 + 1.0/float(perp_leverage))
+
+def daily_borrow_cost_usd(notional: float, borrow_apr: float) -> float:
+    return float(notional) * float(borrow_apr) / 365.0
+
+def round2(x):
+    return None if x is None else (round(float(x), 2))
+
+def format_open_card(ex, sym, r, qty, nf, net_day_usd, gross_day_usd, fees_day_usd, borrow_day_usd):
+    d_human = "Short perp & Long spot" if r["direction"]=="SHORT_PERP_LONG_SPOT" else "Long perp & Short spot"
+    lines = [
+        "🚀 <b>Funding OPEN</b>",
+        f"<b>{ex.upper()} {sym}</b>",
+        f"<code>APR: {r['apr_pct']}% | 8h: {round((r['rate_8h'] or 0)*100,6)}%</code>",
+        f"Dir: <b>{d_human}</b>",
+        f"Price: {r['price']} | Qty(est): {qty}",
+        f"Next funding: {nf}",
+        "",
+        f"<b>Profit/day (net): ${round2(net_day_usd)}</b>",
+        f"  • Funding/day (gross): ${round2(gross_day_usd)}",
+        f"  • Fees/day (amort): ${round2(fees_day_usd)}",
+        f"  • Borrow/day: ${round2(borrow_day_usd)}",
+    ]
+    return "\n".join(lines)
+
+# ---------- Binance Top-N symbols ----------
+def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List[str]:
+    try:
+        exinfo = SESSION.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT)
+        exinfo.raise_for_status()
+        info = exinfo.json()
+        perp_usdt = {
+            s["symbol"] for s in info.get("symbols", [])
+            if s.get("contractType") == "PERPETUAL"
+            and s.get("quoteAsset") == "USDT"
+            and s.get("status") == "TRADING"
+        }
+        t24 = SESSION.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=REQUEST_TIMEOUT)
+        t24.raise_for_status()
+        rows = t24.json()
+        items = []
+        for r in rows:
+            sym = r.get("symbol")
+            if sym in perp_usdt:
+                qv = to_float(r.get("quoteVolume")) or 0.0
+                if qv >= float(min_quote_usdt):
+                    items.append((sym, qv))
+        items.sort(key=lambda x: x[1], reverse=True)
+        symbols = [sym for sym, _ in items[: int(top_n)]]
+        return symbols
+    except Exception as e:
+        logging.warning("binance_top_perp_usdt error: %s", e)
+        return []
+
 # ------------------------------
-# Exchange clients (public REST)
+# Exchange clients
 # ------------------------------
 def binance_premium_index(symbol: str) -> Optional[Dict[str, Any]]:
     url = "https://fapi.binance.com/fapi/v1/premiumIndex"
     try:
-        r = SESSION.get(url, params={"symbol": symbol.upper()}, timeout=DEFAULT_TIMEOUT)
+        r = SESSION.get(url, params={"symbol": symbol.upper()}, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
             logging.debug("Binance %s -> %s", symbol, r.text[:200])
             return None
@@ -187,7 +445,7 @@ def fetch_bybit_mark_price(symbol: str) -> Optional[float]:
     try:
         url = "https://api.bybit.com/v5/market/tickers"
         params = {"category": "linear", "symbol": symbol.upper()}
-        r = SESSION.get(url, params=params, timeout=DEFAULT_TIMEOUT)
+        r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             j = r.json()
             rows = (j.get("result") or {}).get("list") or []
@@ -198,11 +456,10 @@ def fetch_bybit_mark_price(symbol: str) -> Optional[float]:
     return None
 
 def bybit_latest_funding(symbol: str) -> Optional[Dict[str, Any]]:
-    # v5 funding history (last event)
     try:
         url = "https://api.bybit.com/v5/market/funding/history"
         params = {"category": "linear", "symbol": symbol.upper(), "limit": 1}
-        r = SESSION.get(url, params=params, timeout=DEFAULT_TIMEOUT)
+        r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             j = r.json()
             rows = (j.get("result") or {}).get("list") or []
@@ -237,7 +494,7 @@ def okx_mark_price(inst_id: str) -> Optional[float]:
     try:
         url = "https://www.okx.com/api/v5/public/mark-price"
         params = {"instType": "SWAP", "instId": inst_id}
-        r = SESSION.get(url, params=params, timeout=DEFAULT_TIMEOUT)
+        r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             j = r.json()
             data = j.get("data") or []
@@ -251,7 +508,7 @@ def okx_funding(symbol: str) -> Optional[Dict[str, Any]]:
     inst_id = okx_inst_id(symbol)
     url = "https://www.okx.com/api/v5/public/funding-rate"
     try:
-        r = SESSION.get(url, params={"instId": inst_id}, timeout=DEFAULT_TIMEOUT)
+        r = SESSION.get(url, params={"instId": inst_id}, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
             logging.debug("OKX %s -> %s", inst_id, r.text[:200])
             return None
@@ -277,34 +534,7 @@ def okx_funding(symbol: str) -> Optional[Dict[str, Any]]:
         return None
 
 # ------------------------------
-# State & I/O
-# ------------------------------
-def read_csv(path: str, columns: List[str]) -> pd.DataFrame:
-    if not path or not os.path.exists(path):
-        return pd.DataFrame(columns=columns)
-    try:
-        df = pd.read_csv(path)
-        # ensure columns
-        for c in columns:
-            if c not in df.columns:
-                df[c] = None
-        return df[columns]
-    except Exception:
-        return pd.DataFrame(columns=columns)
-
-def write_csv(path: str, df: pd.DataFrame) -> None:
-    tmp = f"{path}.tmp"
-    df.to_csv(tmp, index=False)
-    os.replace(tmp, path)
-
-def append_csv(path: str, df: pd.DataFrame) -> None:
-    if df is None or df.empty:
-        return
-    header = not os.path.exists(path)
-    df.to_csv(path, mode="a", header=header, index=False)
-
-# ------------------------------
-# Core scan & signal logic
+# Scan
 # ------------------------------
 def scan_all(exchanges: List[str], symbols: List[str]) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
@@ -317,7 +547,7 @@ def scan_all(exchanges: List[str], symbols: List[str]) -> pd.DataFrame:
                 row = bybit_latest_funding(sym)
             elif ex == "okx":
                 row = okx_funding(sym)
-            if not row: 
+            if not row:
                 continue
             r8 = row.get("rate_8h")
             apr = annualize_from_8h(r8) if r8 is not None else None
@@ -330,68 +560,112 @@ def scan_all(exchanges: List[str], symbols: List[str]) -> pd.DataFrame:
             rows.append(row)
     return pd.DataFrame(rows)
 
+# ------------------------------
+# Main
+# ------------------------------
 def main():
-    p = argparse.ArgumentParser(description="Funding signaler (single-run for cron).")
-    p.add_argument("--exchanges", nargs="+", default=DEFAULT_EXCHANGES)
-    p.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS)
-    p.add_argument("--entry-apr", type=float, default=DEFAULT_ENTRY_APR, help="Open when |APR| >= this percent")
-    p.add_argument("--exit-apr",  type=float, default=DEFAULT_EXIT_APR,  help="Close when |APR| < this percent")
-    p.add_argument("--max-holding-h", type=float, default=DEFAULT_MAX_HOLD_H, help="Force close after N hours")
-    p.add_argument("--notional", type=float, default=DEFAULT_NOTIONAL, help="Notional per leg (USD) for payout estimates")
-    p.add_argument("--raw-csv", default=DEFAULT_RAW_CSV, help="Append all scans here (optional)")
-    p.add_argument("--log-csv", default=DEFAULT_LOG_CSV, help="Signals log CSV")
-    p.add_argument("--positions-csv", default=DEFAULT_POS_CSV, help="Active positions CSV")
-    p.add_argument("--notify", action="store_true", help="Send Telegram messages")
-    p.add_argument("--dry-run", action="store_true", help="Do not modify positions/log, just print/notify")
-    p.add_argument("--debug", action="store_true", help="Verbose logging")
-    p.add_argument("--symbols-source", type=str, default="binance-top", help="If 'binance-top', автоформирует список символов по объёму с Binance Futures.")
-    p.add_argument("--top-n", type=int, default=200, help="Сколько топ‑символов брать с Binance при --symbols-source binance-top (по умолчанию 200).")
-    p.add_argument("--min-quote-usdt", type=float, default=10000000, help="Минимальный 24h quoteVolume (USDT) при построении списка с Binance.")
-    p.add_argument("--save-symbols", type=str, default=None, help="Путь, куда сохранить финальный список символов (по одной строке).")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--noop", action="store_true", help="No-op, everything via ENV")
+    ap.parse_args()
 
-    args = p.parse_args()
+    exchanges = [x.lower() for x in getenv_list("EXCHANGES", ["binance","bybit","okx"])]
+    symbols_source = getenv_str("SYMBOLS_SOURCE", "binance-top").lower()
+    symbols = [x.upper() for x in getenv_list("SYMBOLS", ["BTCUSDT","ETHUSDT","SOLUSDT"])]
+    top_n = int(getenv_float("TOP_N", 200))
+    min_quote_usdt = float(getenv_float("MIN_QUOTE_USDT", 10_000_000))
+    save_symbols_path = getenv_str("SAVE_SYMBOLS_PATH", "")
 
-    symbols = [x.upper() for x in args.symbols]
-    exchanges = [x.lower() for x in args.exchanges]
+    entry_apr = float(getenv_float("ENTRY_APR", 15.0))
+    exit_apr  = float(getenv_float("EXIT_APR", 8.0))
+    max_holding_h = float(getenv_float("MAX_HOLDING_H", 48.0))
 
-    # Автогенерация символов по объёму с Binance, если указано
-    if args.symbols_source and args.symbols_source.lower() == "binance-top":
+    notional_env = getenv_str("NOTIONAL","")
+    notional = float(notional_env) if notional_env else None
+    capital = float(getenv_float("CAPITAL", 1000.0))
+    perp_leverage = float(getenv_float("PERP_LEVERAGE", 5.0))
+    taker_fee = float(getenv_float("TAKER_FEE", 0.0005))
+    borrow_apr = float(getenv_float("BORROW_APR", 0.10))
+    expected_holding_h = float(getenv_float("EXPECTED_HOLDING_H", 24.0))
+
+    top_n_tg = int(getenv_float("TOP_N_TELEGRAM", 3))
+    rotate = getenv_bool("ROTATE", False)
+    rotate_delta_usd = float(getenv_float("ROTATE_DELTA_USD", 0.0))
+
+    raw_csv_path = getenv_str("RAW_CSV_PATH", "")
+    log_csv_path = getenv_str("LOG_CSV_PATH", "signals_log.csv")
+    positions_csv_path = getenv_str("POSITIONS_CSV_PATH", "positions.csv")
+
+    # итоговый нотuонал
+    if notional is not None:
+        eff_notional = float(notional)
+    else:
+        eff_notional = leg_notional_from_capital(capital, perp_leverage)
+    logging.info("Effective per-leg notional = $%.2f (capital=%.2f, leverage=%.2f)",
+                 eff_notional, capital, perp_leverage)
+
+    # авто-список символов
+    if symbols_source == "binance-top":
         logging.info("Building symbols from Binance top-%s by 24h quote volume (min %s USDT)...",
-                    args.top_n, args.min_quote_usdt)
-        symbols = binance_top_perp_usdt(top_n=args.top_n, min_quote_usdt=args.min_quote_usdt)
-        if not symbols:
-            logging.warning("Binance top list is empty; fallback to CLI --symbols.")
-            symbols = [x.upper() for x in args.symbols]
-        else:
-            logging.info("Got %d symbols. First 10: %s", len(symbols), " ".join(symbols[:10]))
-        if args.save_symbols:
+                     top_n, min_quote_usdt)
+        symbols = binance_top_perp_usdt(top_n=top_n, min_quote_usdt=min_quote_usdt) or symbols
+        logging.info("Got %d symbols. First 10: %s", len(symbols), " ".join(symbols[:10]))
+        if save_symbols_path:
             try:
-                with open(args.save_symbols, "w") as f:
-                    for s in symbols:
-                        f.write(s + "\n")
-                logging.info("Saved symbols to %s", args.save_symbols)
+                out_path = expand_storage_path(save_symbols_path)
+                if is_gs(out_path):
+                    from io import StringIO
+                    buf = StringIO()
+                    buf.write("\n".join(symbols) + "\n")
+                    client = _get_gcs()
+                    bucket, blob = gcs_split(out_path)
+                    client.bucket(bucket).blob(blob).upload_from_string(buf.getvalue(), content_type="text/plain; charset=utf-8")
+                else:
+                    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                    with open(out_path, "w") as f:
+                        for s in symbols:
+                            f.write(s + "\n")
+                logging.info("Saved symbols to %s", out_path)
             except Exception as e:
                 logging.warning("save-symbols error: %s", e)
 
-        if args.debug:
-            logging.getLogger().setLevel(logging.DEBUG)
-
-    # scan
+    # скан
     df = scan_all(exchanges, symbols)
+    if df.empty:
+        print("No data rows.")
+        return
 
-    # raw logging
-    if args.raw_csv:
-        append_csv(args.raw_csv, df)
+    # расчёт чистой прибыли/день
+    gross_day, fees_day, borrow_day, net_day = [], [], [], []
+    hold_days = max(1.0/24.0, expected_holding_h/24.0)
+    fees_total = 4.0 * taker_fee * eff_notional  # entry+exit, spot+perp
+    fees_day_amort = fees_total / hold_days
 
-    # load state
-    pos_cols = ["exchange","symbol","direction","entry_time_utc","entry_ts","entry_rate_8h","entry_apr_pct","entry_price","notional_usd"]
-    positions = read_csv(args.positions_csv, pos_cols)
+    for _, row in df.iterrows():
+        r8 = row.get("rate_8h") or 0.0
+        g = 3.0 * float(r8) * eff_notional
+        b = daily_borrow_cost_usd(eff_notional, borrow_apr) if row["direction"] == "LONG_PERP_SHORT_SPOT" else 0.0
+        gross_day.append(g)
+        fees_day.append(fees_day_amort)
+        borrow_day.append(b)
+        net_day.append(g - fees_day_amort - b)
 
-    # prepare logs
+    df["gross_day_usd"] = gross_day
+    df["fees_day_usd"]  = fees_day
+    df["borrow_day_usd"] = borrow_day
+    df["net_day_usd"]   = net_day
+
+    # сырые логи скана
+    if raw_csv_path:
+        append_csv(raw_csv_path, df)
+
+    # загрузить состояние позиций
+    pos_cols = ["exchange","symbol","direction","entry_time_utc","entry_ts","entry_rate_8h","entry_apr_pct","entry_price","notional_usd","net_day_usd"]
+    positions = read_csv(positions_csv_path, pos_cols)
+
+    # подготовка логов
     log_cols = ["time_utc","action","exchange","symbol","direction","rate_8h","apr_pct","price","notional_usd","payout_8h_usd","payout_day_usd","reason"]
     batch_logs = []
 
-    # helpers to find current row
     def current_row(ex, sym) -> Optional[pd.Series]:
         sub = df[(df["exchange"]==ex) & (df["symbol"]==sym)]
         if sub.empty: return None
@@ -400,7 +674,7 @@ def main():
     now_ms = utc_ms_now()
     now_utc = fmt_ts(now_ms)
 
-    # ---- CLOSE logic for existing positions ----
+    # CLOSE‑логика
     to_remove_idx = []
     for i, pos in positions.iterrows():
         ex, sym, dir_ = pos["exchange"], pos["symbol"], pos["direction"]
@@ -417,94 +691,108 @@ def main():
             holding_h = round((now_ms - int(entry_ts)) / (1000*3600), 2)
 
         reason = None
-        if apr_abs is not None and apr_abs < float(args.exit_apr):
-            reason = f"APR {apr_abs}% < exit {args.exit_apr}%"
-        if reason is None and holding_h is not None and holding_h >= float(args.max_holding_h):
-            reason = f"Max holding {holding_h}h ≥ {args.max_holding_h}h"
+        if apr_abs is not None and apr_abs < exit_apr:
+            reason = f"APR {apr_abs}% < exit {exit_apr}%"
+        if reason is None and holding_h is not None and holding_h >= max_holding_h:
+            reason = f"Max holding {holding_h}h ≥ {max_holding_h}h"
         if reason is None and sign_flip:
             reason = f"Direction flip {dir_} -> {cr['direction']}"
 
         if reason:
-            # log CLOSE
-            payout8 = payout_8h_usd(cr["rate_8h"], args.notional)
-            payoutd = payout_day_usd(cr["rate_8h"], args.notional)
+            payout8 = payout_8h_usd(cr["rate_8h"], eff_notional)
+            payoutd = payout_day_usd(cr["rate_8h"], eff_notional)
             batch_logs.append({
                 "time_utc": now_utc, "action":"CLOSE",
                 "exchange": ex, "symbol": sym, "direction": dir_,
                 "rate_8h": cr["rate_8h"], "apr_pct": cr["apr_pct"], "price": cr["price"],
-                "notional_usd": args.notional, "payout_8h_usd": payout8, "payout_day_usd": payoutd,
+                "notional_usd": eff_notional, "payout_8h_usd": payout8, "payout_day_usd": payoutd,
                 "reason": reason
             })
             msg = (f"✅ <b>Funding CLOSE</b>\n"
                    f"{ex.upper()} {sym}\n"
                    f"APR: {cr['apr_pct']}% | 8h: {round((cr['rate_8h'] or 0)*100,6)}%\n"
                    f"Dir: {dir_}\nReason: {reason}")
-            if args.notify: maybe_send_telegram(msg)
+            maybe_send_telegram(msg)
             to_remove_idx.append(i)
 
-    if not args.dry_run and to_remove_idx:
+    if to_remove_idx:
         positions = positions.drop(index=to_remove_idx).reset_index(drop=True)
 
-    # ---- OPEN logic for new opportunities ----
-    for _, r in df.iterrows():
-        ex, sym, dir_ = r["exchange"], r["symbol"], r["direction"]
-        if dir_ not in ["SHORT_PERP_LONG_SPOT","LONG_PERP_SHORT_SPOT"]:
-            continue
-        apr_abs = abs(r["apr_pct"]) if r["apr_pct"] is not None else None
-        if apr_abs is None or apr_abs < float(args.entry_apr):
-            continue
-        # skip if already open
-        already = positions[(positions["exchange"]==ex) & (positions["symbol"]==sym)]
-        if not already.empty:
-            continue
+    # Кандидаты по net/day
+    candidates = df.copy()
+    candidates = candidates[candidates["apr_pct"].abs() >= entry_apr]
+    candidates = candidates.sort_values("net_day_usd", ascending=False)
 
-        # OPEN
-        entry_qty = hedge_qty(args.notional, r["price"])
-        payout8 = payout_8h_usd(r["rate_8h"], args.notional)
-        payoutd = payout_day_usd(r["rate_8h"], args.notional)
-
-        if args.notify:
-            direction_human = "Short perp & Long spot" if dir_=="SHORT_PERP_LONG_SPOT" else "Long perp & Short spot"
+    # TOP‑N в канал
+    if top_n_tg > 0 and not candidates.empty:
+        publish_rows = candidates.iloc[1:1+top_n_tg] if len(candidates) > 1 else pd.DataFrame(columns=candidates.columns)
+        for _, r in publish_rows.iterrows():
+            qty = hedge_qty(eff_notional, r["price"])
             nf = r.get("next_funding_utc") or "n/a"
-            msg = (f"🚀 <b>Funding OPEN</b>\n"
-                   f"{ex.upper()} {sym}\n"
-                   f"APR: {r['apr_pct']}% | 8h: {round((r['rate_8h'] or 0)*100,6)}%\n"
-                   f"Dir: {direction_human}\n"
-                   f"Price: {r['price']} | Qty(est): {entry_qty}\n"
-                   f"Next funding: {nf}\n"
-                   f"Payout est: 8h ${payout8} / day ${payoutd}")
-            maybe_send_telegram(msg)
+            card = format_open_card(r["exchange"], r["symbol"], r, qty, nf,
+                                    r["net_day_usd"], r["gross_day_usd"], r["fees_day_usd"], r["borrow_day_usd"])
+            maybe_send_telegram(card)
 
-        # persist position & log
-        new_pos = {
-            "exchange": ex, "symbol": sym, "direction": dir_,
-            "entry_time_utc": r["time_utc"], "entry_ts": r["ts"],
-            "entry_rate_8h": r["rate_8h"], "entry_apr_pct": r["apr_pct"],
-            "entry_price": r["price"], "notional_usd": args.notional
-        }
-        if not args.dry_run:
-            if positions.empty:
-                positions = pd.DataFrame([new_pos], columns=["exchange","symbol","direction","entry_time_utc","entry_ts","entry_rate_8h","entry_apr_pct","entry_price","notional_usd"])
+    # OPEN/ROTATE: держим одну позицию
+    current_pos = positions.iloc[0] if len(positions) > 0 else None
+    best = candidates.head(1)
+    if not best.empty:
+        r = best.iloc[0]
+        ex, sym, dir_ = r["exchange"], r["symbol"], r["direction"]
+
+        need_open = current_pos is None
+        if current_pos is not None:
+            same = (str(current_pos["exchange"]).lower() == ex) and (str(current_pos["symbol"]).upper() == sym)
+            if same:
+                need_open = False
             else:
-                positions = pd.concat([positions, pd.DataFrame([new_pos])], ignore_index=True)
+                current_net = 0.0 if pd.isna(current_pos.get("net_day_usd", None)) else float(current_pos.get("net_day_usd", 0.0))
+                delta_usd = float(r["net_day_usd"] or 0.0) - current_net
+                if rotate and delta_usd > float(rotate_delta_usd):
+                    close_msg = (f"🔁 <b>Funding ROTATE</b>\n"
+                                 f"Close: {str(current_pos['exchange']).upper()} {str(current_pos['symbol']).upper()}\n"
+                                 f"Open:  {ex.upper()} {sym}\n"
+                                 f"Delta net/day: ${round2(delta_usd)}")
+                    maybe_send_telegram(close_msg)
+                    positions = positions.iloc[0:0]
+                    need_open = True
+                else:
+                    need_open = False
 
-        batch_logs.append({
-            "time_utc": now_utc, "action":"OPEN",
-            "exchange": ex, "symbol": sym, "direction": dir_,
-            "rate_8h": r["rate_8h"], "apr_pct": r["apr_pct"], "price": r["price"],
-            "notional_usd": args.notional, "payout_8h_usd": payout8, "payout_day_usd": payoutd,
-            "reason": f"|APR| {apr_abs}% ≥ entry {args.entry_apr}%"
-        })
+        if need_open:
+            entry_qty = hedge_qty(eff_notional, r["price"])
+            payout8 = payout_8h_usd(r["rate_8h"], eff_notional)
+            payoutd = r["gross_day_usd"]
+            nf = r.get("next_funding_utc") or "n/a"
 
-    # write out
-    if not args.dry_run:
-        write_csv(args.positions_csv, positions)
-        if batch_logs:
-            append_csv(args.log_csv, pd.DataFrame(batch_logs))
+            card = format_open_card(ex, sym, r, entry_qty, nf,
+                                    r["net_day_usd"], r["gross_day_usd"], r["fees_day_usd"], r["borrow_day_usd"])
+            maybe_send_telegram(card)
 
-    # friendly stdout for cron logs
+            new_pos = {
+                "exchange": ex, "symbol": sym, "direction": dir_,
+                "entry_time_utc": r["time_utc"], "entry_ts": r["ts"],
+                "entry_rate_8h": r["rate_8h"], "entry_apr_pct": r["apr_pct"],
+                "entry_price": r["price"], "notional_usd": eff_notional,
+                "net_day_usd": r["net_day_usd"]
+            }
+            positions = pd.DataFrame([new_pos], columns=list(new_pos.keys()))
+            batch_logs.append({
+                "time_utc": now_utc, "action":"OPEN",
+                "exchange": ex, "symbol": sym, "direction": dir_,
+                "rate_8h": r["rate_8h"], "apr_pct": r["apr_pct"], "price": r["price"],
+                "notional_usd": eff_notional, "payout_8h_usd": payout8, "payout_day_usd": payoutd,
+                "reason": "best net/day"
+            })
+
+    # запись состояния
+    write_csv(positions_csv_path, positions)
+    if batch_logs:
+        append_csv(log_csv_path, pd.DataFrame(batch_logs))
+
+    # stdout
     if not df.empty:
-        printable = df[["exchange","symbol","price","rate_8h","rate_8h_pct","apr_pct","time_utc","next_funding_utc","direction"]]
+        printable = df[["exchange","symbol","price","rate_8h","rate_8h_pct","apr_pct","net_day_usd","time_utc","next_funding_utc","direction"]]
         print(printable.to_string(index=False))
     else:
         print("No data rows.")
