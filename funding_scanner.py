@@ -61,6 +61,10 @@ Funding Signaler + Availability Matrix (All-in-One)
   REQUEST_TIMEOUT=15
   DEBUG=false
 """
+# Новые ENV для работы с матрицей:
+# MATRIX_READ_PATH=gs://thinarthrillbucket/funding_scanner/matrix_union.csv
+# MATRIX_MODE=union           # union | intersection | atleast:2
+# MATRIX_USE_PER_EXCHANGE=true  # если true — сканер берёт набор тикеров отдельно для каждой биржи из матрицы
 
 import os
 import sys
@@ -332,6 +336,129 @@ def append_csv(path: Optional[str], df: pd.DataFrame) -> None:
         return
     header = not os.path.exists(p)
     df.to_csv(p, mode="a", header=header, index=False)
+
+# ===== Matrix I/O helpers =====
+
+def _gcs_read_any(gs_path: str) -> pd.DataFrame:
+    """Прямое чтение CSV из GCS без списка ожидаемых колонок."""
+    try:
+        client = gcs_client()
+        bucket_name, blob_name = gcs_split(gs_path)
+        bucket = client.lookup_bucket(bucket_name)
+        if bucket is None:
+            raise FileNotFoundError(f"Bucket '{bucket_name}' not found or access denied")
+        blob = bucket.blob(blob_name)
+        if not blob.exists():
+            return pd.DataFrame()
+        data = blob.download_as_bytes()
+        return pd.read_csv(pd.io.common.BytesIO(data))
+    except Exception as e:
+        logging.warning("GCS read (any) error %s: %s", gs_path, e)
+        return pd.DataFrame()
+
+def load_matrix_df(matrix_path: str) -> pd.DataFrame:
+    """
+    Считывает матрицу доступности из локального пути или gs://...
+    Приводит TRUE/FALSE к bool.
+    """
+    p = bucketize_path(matrix_path)
+    if not p:
+        return pd.DataFrame()
+    try:
+        if is_gs(p):
+            df = _gcs_read_any(p)
+        else:
+            df = pd.read_csv(p)
+    except Exception as e:
+        logging.warning("Matrix read error %s: %s", p, e)
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    # нормализуем колонки и типы
+    df.columns = [c.strip() for c in df.columns]
+    if "symbol" not in df.columns:
+        logging.warning("Matrix has no 'symbol' column: %s", df.columns.tolist())
+        return pd.DataFrame()
+
+    # приведение True/False (иногда приезжает как 'True'/'False'/'1'/'0')
+    for c in df.columns:
+        if c in ("symbol", "listed_on"):
+            continue
+        try:
+            if df[c].dtype == object:
+                df[c] = df[c].astype(str).str.strip().str.lower().isin(("true","1","t","y","yes"))
+            else:
+                df[c] = df[c].astype(bool)
+        except Exception:
+            pass
+    if "listed_on" in df.columns:
+        try:
+            df["listed_on"] = pd.to_numeric(df["listed_on"], errors="coerce").fillna(0).astype(int)
+        except Exception:
+            pass
+    return df
+
+def symbols_from_matrix(
+    matrix_path: str,
+    exchanges: List[str],
+    mode: str = "union"  # "union" | "intersection" | "atleast:k"
+) -> List[str]:
+    """
+    Возвращает список символов из матрицы по заданным биржам.
+    - union: есть хотя бы на одной из бирж
+    - intersection: есть на всех биржах
+    - atleast:k  (например, atleast:2)
+    """
+    df = load_matrix_df(matrix_path)
+    if df.empty:
+        return []
+
+    ex_cols = [ex for ex in exchanges if ex in df.columns]
+    if not ex_cols:
+        # если в матрице нет колонок с такими биржами — отдаём пусто
+        logging.warning("Matrix has no columns for exchanges: %s (have: %s)", exchanges, df.columns.tolist())
+        return []
+
+    sub = df[["symbol"] + ex_cols].copy()
+
+    if mode.startswith("atleast:"):
+        try:
+            k = int(mode.split(":",1)[1])
+        except Exception:
+            k = 1
+        mask = sub[ex_cols].sum(axis=1) >= k
+    elif mode == "intersection":
+        mask = sub[ex_cols].all(axis=1)
+    else:
+        mask = sub[ex_cols].any(axis=1)
+
+    out = sorted(sub.loc[mask, "symbol"].dropna().astype(str).str.upper().unique().tolist())
+    return out
+
+def matrix_by_exchange(
+    matrix_path: str,
+    exchanges: List[str]
+) -> Dict[str, List[str]]:
+    """
+    Возвращает словарь {exchange: [symbols...]} — только те пары,
+    где в матрице для этой биржи стоит True.
+    Удобно для точечного сканирования без «лишних» запросов к API.
+    """
+    df = load_matrix_df(matrix_path)
+    if df.empty:
+        return {ex: [] for ex in exchanges}
+
+    ex_cols = [ex for ex in exchanges if ex in df.columns]
+    out: Dict[str, List[str]] = {}
+    for ex in exchanges:
+        if ex not in ex_cols:
+            out[ex] = []
+            continue
+        syms = df.loc[df[ex].astype(bool), "symbol"].dropna().astype(str).str.upper().unique().tolist()
+        out[ex] = sorted(syms)
+    return out
 
 # ------------------------------
 # Exchange clients (funding)
@@ -754,10 +881,61 @@ DEFAULT_EXCHANGES = ["binance","bybit","okx"]
 DEFAULT_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","BNBUSDT","LINKUSDT","ADAUSDT","TONUSDT","OPUSDT","ARBUSDT","PEPEUSDT"]
 COMMON_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","LINKUSDT","BNBUSDT","ADAUSDT"]
 
-def scan_all(exchanges: List[str], symbols: List[str]) -> pd.DataFrame:
+# ===== Symbols resolution =====
+exchanges = getenv_list("EXCHANGES", DEFAULT_EXCHANGES)
+src = getenv_str("SYMBOLS_SOURCE", "common").lower()  # common | binance-top | union | manual | matrix
+symbols_env = getenv_list("SYMBOLS", [])              # если manual
+top_n = int(getenv_float("TOP_N", 200))
+min_quote = float(getenv_float("MIN_QUOTE_USDT", 10_000_000))
+
+# Путь к матрице и режим выбора из неё
+matrix_path = getenv_str("MATRIX_READ_PATH", "")
+matrix_mode = getenv_str("MATRIX_MODE", "union")  # union | intersection | atleast:k
+use_per_ex = getenv_bool("MATRIX_USE_PER_EXCHANGE", True)
+
+if src == "manual" and symbols_env:
+    symbols = [s.upper() for s in symbols_env]
+elif src == "binance-top":
+    symbols = binance_top_perp_usdt(top_n=top_n, min_quote_usdt=min_quote)
+elif src == "union":
+    # «на лету» собирать union по API как раньше — можно, но лучше взять из матрицы, если задана
+    if matrix_path:
+        symbols = symbols_from_matrix(matrix_path, exchanges, mode="union")
+    else:
+        symbols = COMMON_SYMBOLS  # фолбэк
+elif src == "common":
+    symbols = COMMON_SYMBOLS
+elif src == "matrix":
+    if not matrix_path:
+        logging.error("SYMBOLS_SOURCE=matrix, но MATRIX_READ_PATH не задан — беру COMMON")
+        symbols = COMMON_SYMBOLS
+    else:
+        symbols = symbols_from_matrix(matrix_path, exchanges, mode=matrix_mode)
+else:
+    symbols = COMMON_SYMBOLS
+
+logging.info("Symbols selected (%d): %s", len(symbols), symbols[:20])
+
+# Если хотим ещё точнее — использовать матрицу ПО-БИРЖАМ:
+symbols_by_ex: Optional[Dict[str, List[str]]] = None
+if use_per_ex and matrix_path:
+    symbols_by_ex = matrix_by_exchange(matrix_path, exchanges)
+    # На всякий случай — ограничим словари только теми символами, что попали в итоговый набор 'symbols'
+    symbols_set = set(symbols)
+    for ex in list(symbols_by_ex.keys()):
+        symbols_by_ex[ex] = sorted(list(symbols_set.intersection(symbols_by_ex.get(ex, []))))
+
+def scan_all(exchanges: List[str], symbols: List[str], symbols_by_ex: Optional[Dict[str, List[str]]] = None) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for ex in exchanges:
-        for sym in symbols:
+        # подберём подходящий список тикеров
+        ex_symbols = symbols_by_ex.get(ex) if symbols_by_ex else None
+        if ex_symbols is None:
+            ex_symbols = symbols
+        if not ex_symbols:
+            continue
+
+        for sym in ex_symbols:
             row = None
             if ex == "binance":
                 row = binance_premium_index(sym)
@@ -1101,7 +1279,8 @@ def main():
         logging.info("Unknown SYMBOLS_SOURCE=%s, using defaults", symbols_source)
 
     # Scan
-    df = scan_all(exchanges, symbols)
+    df = scan_all(exchanges, symbols, symbols_by_ex=symbols_by_ex)
+
     if not df.empty:
         # Costs/PNL metrics
         gross_day, fees_day, borrow_day, net_day = [], [], [], []
