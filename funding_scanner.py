@@ -115,7 +115,7 @@ def getenv_list(key: str, default_list: List[str]) -> List[str]:
 # ------------------------------
 USER_AGENT = getenv_str("USER_AGENT", "FundingSignaler/1.4")
 REQUEST_TIMEOUT = int(getenv_float("REQUEST_TIMEOUT", 15))
-BACKET = getenv_str("GCS_BUCKET", "thinarthrill")
+
 logging.basicConfig(
     level=logging.DEBUG if getenv_bool("DEBUG", False) else logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -1359,7 +1359,7 @@ def main():
 
         top_n_tg = max(0, int(top_n_tg))
         if top_n_tg > 0 and not candidates.empty:
-            publish_rows = candidates.iloc[1:1+top_n_tg] if len(candidates) > 1 else pd.DataFrame(columns=candidates.columns)
+            publish_rows = candidates.iloc[top_n_tg] if len(candidates) > 1 else pd.DataFrame(columns=candidates.columns)
             for _, r in publish_rows.iterrows():
                 if r["price"] is None or r["price"] < MIN_PRICE:
                     continue
