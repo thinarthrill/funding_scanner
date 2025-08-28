@@ -164,13 +164,14 @@ def gcs_split(gs_path: str):
 def gcs_client():
     if not GCS_AVAILABLE:
         raise RuntimeError("google-cloud-storage not installed")
-    key_str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    key_str = os.getenv("GCS_KEY_JSON", "").strip()
     if key_str:
         info = json.loads(key_str)
         creds = service_account.Credentials.from_service_account_info(info)
         return storage.Client(project=info.get("project_id"), credentials=creds)
-    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip():
-        return storage.Client()
+    key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if key_path:
+        return storage.Client.from_service_account_json(key_path)
     return storage.Client()
 
 def gcs_read_csv(gs_path: str, expected_columns: List[str]) -> pd.DataFrame:
@@ -1219,8 +1220,6 @@ def main():
     args = ap.parse_args()
 
     exchanges = [x.lower() for x in getenv_list("EXCHANGES", DEFAULT_EXCHANGES)]
-    symbols_source = getenv_str("SYMBOLS_SOURCE", "binance-top").lower()
-    symbols = [x.upper() for x in getenv_list("SYMBOLS", DEFAULT_SYMBOLS)]
     top_n = int(getenv_float("TOP_N", 200))
     min_quote_usdt = float(getenv_float("MIN_QUOTE_USDT", 10_000_000))
 
@@ -1264,19 +1263,6 @@ def main():
     else:
         eff_notional = leg_notional_from_capital(capital, perp_leverage)
     logging.info("Effective per-leg notional = $%.2f (capital=%.2f, leverage=%.2f)", eff_notional, capital, perp_leverage)
-
-    # SYMBOLS
-    if symbols_source == "binance-top":
-        logging.info("Building symbols from Binance top-%s by 24h quote volume (min %s USDT)...", top_n, min_quote_usdt)
-        symbols = binance_top_perp_usdt(top_n=top_n, min_quote_usdt=min_quote_usdt) or symbols
-        logging.info("Got %d symbols. First 10: %s", len(symbols), " ".join(symbols[:10]))
-    elif symbols_source == "common":
-        symbols = COMMON_SYMBOLS
-        logging.info("Using COMMON symbols: %s", ",".join(symbols))
-    elif symbols_source == "manual":
-        logging.info("Using MANUAL symbols: %s", ",".join(symbols))
-    else:
-        logging.info("Unknown SYMBOLS_SOURCE=%s, using defaults", symbols_source)
 
     # Scan
     df = scan_all(exchanges, symbols, symbols_by_ex=symbols_by_ex)
