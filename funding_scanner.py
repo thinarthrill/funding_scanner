@@ -1,47 +1,87 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Funding Signaler (env-driven, cron-friendly, GCS-aware) — Extended Exchanges
+Funding Signaler + Availability Matrix (All-in-One)
 
-Добавлено больше бирж. Поддерживаемые идентификаторы в EXCHANGES:
-  binance, bybit, okx, mexc, kucoin, deribit, bitget, gate, phemex, krakenf
+- Поддержка бирж: binance, bybit, okx, mexc, kucoin, deribit, bitget, gate, phemex, krakenf
+- Сигналы funding (APR/net/day и т.д.), логирование позиций/сигналов
+- Построение "матрицы доступности" perp-контрактов по выбранным биржам
+- Сохранение CSV локально или в GCS
+- ENV BACKET: если задано имя bucket, относительные пути автоматически преобразуются в gs://<BACKET>/<filename>
 
-Пример:
-  EXCHANGES=binance,bybit,okx,mexc,kucoin,deribit,bitget
+Примеры ENV:
+  EXCHANGES=binance,bybit,okx,mexc,kucoin,bitget,gate,phemex,krakenf,deribit
+  SYMBOLS_SOURCE=binance-top              # common | binance-top | union | manual
+  SYMBOLS=BTCUSDT,ETHUSDT                 # если SYMBOLS_SOURCE=manual
+  TOP_N=150
+  MIN_QUOTE_USDT=15000000
 
-Замечания:
-- Символьные форматы отличаются: для каждой биржи есть функция map_symbol_*,
-  которая переводит стандартный SYMBOL вида 'BTCUSDT' в нативный формат биржи.
-- Все HTTP-запросы под ретраями; ошибки не фатальны — биржа просто пропускается.
+  # Пороговые параметры
+  ENTRY_APR=15
+  EXIT_APR=8
+  MAX_HOLDING_H=48
+  NOTIONAL=                                 # если пусто — считается от CAPITAL и PERP_LEVERAGE
+  CAPITAL=1000
+  PERP_LEVERAGE=5
+  TAKER_FEE=0.0005
+  BORROW_APR=0.10
+  EXPECTED_HOLDING_H=24
+  MIN_NET_DAY_USD=0
+  MIN_PRICE=0
 
-Остальной функционал и ENV-переменные совместимы с базовой версией.
+  # Ротация
+  TOP_N_TELEGRAM=3
+  ROTATE=false
+  ROTATE_DELTA_USD=0
+
+  # Пути вывода (могут быть относительные или gs://...)
+  RAW_CSV_PATH=raw.csv
+  LOG_CSV_PATH=signals_log.csv
+  POSITIONS_CSV_PATH=positions.csv
+
+  # GCS & bucket
+  BACKET=my-bucket-name                     # если задать: raw.csv => gs://my-bucket-name/raw.csv
+  GCS_KEY_JSON=...                          # service account JSON (строкой) ИЛИ GOOGLE_APPLICATION_CREDENTIALS
+
+  # Matrix (по желанию)
+  MATRIX_EXCHANGES=binance,bybit,okx,mexc,kucoin,bitget,gate,phemex,krakenf,deribit
+  MATRIX_UNIVERSE=union                     # common | binance-top | union | manual
+  MATRIX_SYMBOLS=BTCUSDT,ETHUSDT            # когда MATRIX_UNIVERSE=manual
+  MATRIX_TOP_N=200
+  MATRIX_MIN_QUOTE=10000000
+  MATRIX_SLEEP_MS=300
+  MATRIX_SAVE_PATH=matrix.csv
+
+  # Телеграм (опционально)
+  TELEGRAM_BOT_TOKEN=
+  TELEGRAM_CHAT_ID=
+
+  # Прочее
+  USER_AGENT=FundingSignaler/1.4
+  REQUEST_TIMEOUT=15
+  DEBUG=false
 """
 
 import os
 import sys
 import argparse
 import logging
-from typing import Dict, Any, List, Optional
-from datetime import datetime, timezone
 import json
 import hmac, hashlib, time
+from typing import Dict, Any, List, Optional, Set, Any as AnyT
+from datetime import datetime, timezone
 
+# Deps
 try:
     import requests
     import pandas as pd
-except Exception as e:
-    print("Install deps first: pip install requests pandas", file=sys.stderr)
+except Exception:
+    print("Install dependencies: pip install requests pandas", file=sys.stderr)
     raise
 
-# google cloud storage (опционально)
-GCS_AVAILABLE = False
-try:
-    from google.cloud import storage  # type: ignore
-    from google.oauth2 import service_account  # type: ignore
-    GCS_AVAILABLE = True
-except Exception:
-    GCS_AVAILABLE = False
-
+# ------------------------------
+# ENV helpers
+# ------------------------------
 def getenv_str(key: str, default: str = "") -> str:
     v = os.getenv(key)
     return default if v is None or v.strip() == "" else v.strip()
@@ -58,7 +98,7 @@ def getenv_bool(key: str, default: bool) -> bool:
     if v is None:
         return default
     v = v.strip().lower()
-    return v in ["1","true","yes","y","on"]
+    return v in ("1","true","yes","y","on")
 
 def getenv_list(key: str, default_list: List[str]) -> List[str]:
     v = os.getenv(key)
@@ -66,41 +106,126 @@ def getenv_list(key: str, default_list: List[str]) -> List[str]:
         return default_list
     return [x.strip() for x in v.split(",") if x.strip()]
 
-DEFAULT_EXCHANGES = ["binance", "bybit", "okx"]
-DEFAULT_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","BNBUSDT","AVAXUSDT","LINKUSDT","ADAUSDT","TONUSDT","OPUSDT","ARBUSDT","PEPEUSDT"]
-
-USER_AGENT = getenv_str("USER_AGENT", "FundingSignaler/1.3-extended")
-REQUEST_TIMEOUT = int(getenv_float("REQUEST_TIMEOUT", 12))
-
+# ------------------------------
+# Requests session + logging
+# ------------------------------
+USER_AGENT = getenv_str("USER_AGENT", "FundingSignaler/1.4")
+REQUEST_TIMEOUT = int(getenv_float("REQUEST_TIMEOUT", 15))
+BACKET = getenv_str("GCS_BUCKET", "thinarthrill")
 logging.basicConfig(
     level=logging.DEBUG if getenv_bool("DEBUG", False) else logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
 
-# quiet noisy libs
-for noisy in ("urllib3", "requests.packages.urllib3", "aiohttp", "google"):
-    logging.getLogger(noisy).setLevel(logging.WARNING)
-    logging.getLogger(noisy).propagate = False
-
-# retries
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 _retry = Retry(
     total=3,
-    backoff_factor=0.3,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
+    backoff_factor=0.4,
+    status_forcelist=[429,500,502,503,504],
+    allowed_methods=["GET","POST"],
     raise_on_status=False,
 )
 _adapter = HTTPAdapter(max_retries=_retry)
 SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
 
+for noisy in ("urllib3", "requests.packages.urllib3", "google"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+    logging.getLogger(noisy).propagate = False
+
 # ------------------------------
-# Helpers
+# GCS helpers + BACKET support
+# ------------------------------
+GCS_AVAILABLE = True
+try:
+    from google.cloud import storage  # type: ignore
+    from google.oauth2 import service_account  # type: ignore
+    GCS_AVAILABLE = True
+except Exception:
+    GCS_AVAILABLE = False
+
+def is_gs(path: Optional[str]) -> bool:
+    return bool(path) and str(path).startswith("gs://")
+
+def gcs_split(gs_path: str):
+    raw = gs_path[5:]
+    bucket, _, blob = raw.partition("/")
+    return bucket, blob
+
+def gcs_client():
+    if not GCS_AVAILABLE:
+        raise RuntimeError("google-cloud-storage not installed")
+    key_str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if key_str:
+        info = json.loads(key_str)
+        creds = service_account.Credentials.from_service_account_info(info)
+        return storage.Client(project=info.get("project_id"), credentials=creds)
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip():
+        return storage.Client()
+    return storage.Client()
+
+def gcs_read_csv(gs_path: str, expected_columns: List[str]) -> pd.DataFrame:
+    try:
+        client = gcs_client()
+        bucket_name, blob_name = gcs_split(gs_path)
+        bucket = client.lookup_bucket(bucket_name)
+        if bucket is None:
+            raise FileNotFoundError(f"Bucket '{bucket_name}' not found or access denied")
+        blob = bucket.blob(blob_name)
+        if not blob.exists():
+            return pd.DataFrame(columns=expected_columns)
+        data = blob.download_as_bytes()
+        df = pd.read_csv(pd.io.common.BytesIO(data))
+        for c in expected_columns:
+            if c not in df.columns:
+                df[c] = None
+        return df[expected_columns]
+    except Exception as e:
+        logging.warning("GCS read error %s: %s", gs_path, e)
+        return pd.DataFrame(columns=expected_columns)
+
+def gcs_write_csv(gs_path: str, df: pd.DataFrame) -> None:
+    try:
+        client = gcs_client()
+        bucket_name, blob_name = gcs_split(gs_path)
+        bucket = client.lookup_bucket(bucket_name)
+        if bucket is None:
+            raise FileNotFoundError(f"Bucket '{bucket_name}' not found or access denied")
+        blob = bucket.blob(blob_name)
+        from io import StringIO
+        buf = StringIO()
+        df.to_csv(buf, index=False)
+        blob.upload_from_string(buf.getvalue(), content_type="text/csv")
+    except Exception as e:
+        logging.warning("GCS write error %s: %s", gs_path, e)
+
+# ---------- BACKET auto-prefix ----------
+def bucketize_path(path: Optional[str]) -> Optional[str]:
+    """
+    Если задан BACKET (строкой), и path относительный (не gs:// и не абсолютный),
+    вернём gs://<BACKET>/<path>.
+    """
+    if not path or path.strip() == "":
+        return path
+    p = path.strip()
+    if is_gs(p):
+        return p
+    if os.path.isabs(p):
+        return p
+    backet = getenv_str("BACKET", "")
+    if backet:
+        # sanitize slashes
+        p = p.lstrip("/").replace("\\", "/")
+        return f"gs://{backet}/{p}"
+    return p
+
+# ------------------------------
+# Generic utils
 # ------------------------------
 def utc_ms_now() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -158,7 +283,6 @@ def maybe_send_telegram(text: str) -> None:
     token = getenv_str("TELEGRAM_BOT_TOKEN", "")
     chat_id = getenv_str("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
-        logging.debug("Telegram not configured")
         return
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -169,98 +293,16 @@ def maybe_send_telegram(text: str) -> None:
     except Exception as e:
         logging.warning("Telegram exception: %s", e)
 
-def format_open_card(ex, sym, r, qty, nf, net_day_usd, gross_day_usd, fees_day_usd, borrow_day_usd):
-    d_human = "Short perp & Long spot" if r["direction"]=="SHORT_PERP_LONG_SPOT" else "Long perp & Short spot"
-    lines = [
-        "🚀 <b>Funding OPEN</b>",
-        f"<b>{ex.upper()} {sym}</b>",
-        f"<code>APR: {r['apr_pct']}% | 8h: {round((r['rate_8h'] or 0)*100,6)}%</code>",
-        f"Dir: <b>{d_human}</b>",
-        f"Price: {r['price']} | Qty(est): {qty}",
-        f"Next funding: {nf}",
-        "",
-        f"<b>Profit/day (net): ${round2(net_day_usd)}</b>",
-        f"  • Funding/day (gross): ${round2(gross_day_usd)}",
-        f"  • Fees/day (amort): ${round2(fees_day_usd)}",
-        f"  • Borrow/day: ${round2(borrow_day_usd)}",
-    ]
-    return "\n".join(lines)
-
-# ------------------------------
-# GCS + CSV utils (unchanged)
-# ------------------------------
-def is_gs(path: Optional[str]) -> bool:
-    return bool(path) and str(path).startswith("gs://")
-
-def gcs_split(gs_path: str):
-    raw = gs_path[5:]
-    bucket, _, blob = raw.partition("/")
-    return bucket, blob
-
-def gcs_client():
-    if not GCS_AVAILABLE:
-        raise RuntimeError("google-cloud-storage is not installed. pip install google-cloud-storage")
-    key_str = os.getenv("GCS_KEY_JSON", "").strip()
-    if key_str:
-        info = json.loads(key_str)
-        creds = service_account.Credentials.from_service_account_info(info)
-        return storage.Client(project=info.get("project_id"), credentials=creds)
-    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip():
-        return storage.Client()
-    return storage.Client()
-
-def gcs_read_csv(gs_path: str, expected_columns: List[str]) -> pd.DataFrame:
-    try:
-        client = gcs_client()
-        bucket_name, blob_name = gcs_split(gs_path)
-        bucket = client.lookup_bucket(bucket_name)
-        if bucket is None:
-            raise FileNotFoundError(f"Bucket '{bucket_name}' not found or access denied")
-        blob = bucket.blob(blob_name)
-        if not blob.exists():
-            return pd.DataFrame(columns=expected_columns)
-        data = blob.download_as_bytes()
-        df = pd.read_csv(pd.io.common.BytesIO(data))
-        for c in expected_columns:
-            if c not in df.columns:
-                df[c] = None
-        return df[expected_columns]
-    except Exception as e:
-        logging.warning("GCS read error %s: %s", gs_path, e)
-        return pd.DataFrame(columns=expected_columns)
-
-def gcs_write_csv(gs_path: str, df: pd.DataFrame) -> None:
-    try:
-        client = gcs_client()
-        bucket_name, blob_name = gcs_split(gs_path)
-        bucket = client.lookup_bucket(bucket_name)
-        if bucket is None:
-            raise FileNotFoundError(f"Bucket '{bucket_name}' not found or access denied")
-        blob = bucket.blob(blob_name)
-        from io import StringIO
-        buf = StringIO()
-        df.to_csv(buf, index=False)
-        blob.upload_from_string(buf.getvalue(), content_type="text/csv")
-    except Exception as e:
-        logging.warning("GCS write error %s: %s", gs_path, e)
-
-def gcs_append_csv(gs_path: str, df: pd.DataFrame) -> None:
-    if df is None or df.empty:
-        return
-    cols = list(df.columns)
-    existing = gcs_read_csv(gs_path, cols) if is_gs(gs_path) else pd.DataFrame(columns=cols)
-    out = pd.concat([existing, df], ignore_index=True)
-    gcs_write_csv(gs_path, out)
-
 def read_csv(path: Optional[str], columns: List[str]) -> pd.DataFrame:
     if not path or path.strip() == "":
         return pd.DataFrame(columns=columns)
-    if is_gs(path):
-        return gcs_read_csv(path, columns)
-    if not os.path.exists(path):
+    p = bucketize_path(path)
+    if is_gs(p):
+        return gcs_read_csv(p, columns)
+    if not os.path.exists(p):
         return pd.DataFrame(columns=columns)
     try:
-        df = pd.read_csv(path)
+        df = pd.read_csv(p)
         for c in columns:
             if c not in df.columns:
                 df[c] = None
@@ -269,37 +311,40 @@ def read_csv(path: Optional[str], columns: List[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=columns)
 
 def write_csv(path: Optional[str], df: pd.DataFrame) -> None:
-    if not path or path.strip() == "":
+    if not path or path.strip() == "": return
+    p = bucketize_path(path)
+    if is_gs(p):
+        gcs_write_csv(p, df)
         return
-    if is_gs(path):
-        gcs_write_csv(path, df)
-        return
-    tmp = f"{path}.tmp"
+    tmp = f"{p}.tmp"
     df.to_csv(tmp, index=False)
-    os.replace(tmp, path)
+    os.replace(tmp, p)
 
 def append_csv(path: Optional[str], df: pd.DataFrame) -> None:
-    if df is None or df.empty or not path or path.strip() == "":
+    if df is None or df.empty or not path or path.strip() == "": return
+    p = bucketize_path(path)
+    if is_gs(p):
+        # emulate append: read+concat+write
+        cols = list(df.columns)
+        existing = gcs_read_csv(p, cols)
+        out = pd.concat([existing, df], ignore_index=True)
+        gcs_write_csv(p, out)
         return
-    if is_gs(path):
-        gcs_append_csv(path, df)
-        return
-    header = not os.path.exists(path)
-    df.to_csv(path, mode="a", header=header, index=False)
+    header = not os.path.exists(p)
+    df.to_csv(p, mode="a", header=header, index=False)
 
 # ------------------------------
-# Base: Binance / Bybit / OKX (как в твоём скрипте)
+# Exchange clients (funding)
 # ------------------------------
 def bybit_get_fee(symbol: str) -> Optional[float]:
     try:
         api_key = os.getenv("BYBIT_API_KEY", "")
         api_secret = os.getenv("BYBIT_API_SECRET", "")
         if not api_key or not api_secret:
-            logging.debug("Bybit API key/secret не заданы, fallback на TAKER_FEE из ENV")
             return None
         url = "https://api.bybit.com/v5/account/fee-rate"
-        params = {"category": "linear", "symbol": symbol.upper()}
-        ts = str(int(time.time() * 1000))
+        params = {"category":"linear","symbol":symbol.upper()}
+        ts = str(int(time.time()*1000))
         param_str = "&".join([f"{k}={v}" for k,v in sorted(params.items())])
         sign_str = ts + api_key + "5000" + param_str
         signature = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
@@ -315,19 +360,16 @@ def bybit_get_fee(symbol: str) -> Optional[float]:
         if j.get("retCode") == 0:
             fee_str = j["result"]["list"][0]["takerFeeRate"]
             return float(fee_str)
-        else:
-            logging.warning("Bybit fee API error: %s", j)
-            return None
     except Exception as e:
         logging.warning("Bybit fee API exception: %s", e)
-        return None
+    return None
 
+# Binance
 def binance_premium_index(symbol: str) -> Optional[Dict[str, Any]]:
     url = "https://fapi.binance.com/fapi/v1/premiumIndex"
     try:
         r = SESSION.get(url, params={"symbol": symbol.upper()}, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
-            logging.debug("Binance %s -> %s", symbol, r.text[:200])
             return None
         j = r.json()
         return {
@@ -338,41 +380,39 @@ def binance_premium_index(symbol: str) -> Optional[Dict[str, Any]]:
             "next_funding_time": int(j.get("nextFundingTime")) if j.get("nextFundingTime") else None,
             "ts": int(j.get("time")) if j.get("time") else utc_ms_now(),
         }
-    except Exception as e:
-        logging.debug("Binance error %s: %s", symbol, e)
+    except Exception:
         return None
 
+# Bybit
 def fetch_bybit_mark_price(symbol: str) -> Optional[float]:
     try:
-        url = "https://api.bybit.com/v5/market/tickers"
-        params = {"category": "linear", "symbol": symbol.upper()}
-        r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        r = SESSION.get("https://api.bybit.com/v5/market/tickers",
+                        params={"category": "linear", "symbol": symbol.upper()},
+                        timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             j = r.json()
             rows = (j.get("result") or {}).get("list") or []
             if rows:
-                px = (to_float(rows[0].get("lastPrice"))
-                      or to_float(rows[0].get("markPrice"))
-                      or None)
-                if px:
-                    return px
-        mp = SESSION.get("https://api.bybit.com/v5/market/mark-price-kline",
+                px = (to_float(rows[0].get("lastPrice")) or to_float(rows[0].get("markPrice")))
+                if px: return px
+        # fallback
+        r2 = SESSION.get("https://api.bybit.com/v5/market/mark-price-kline",
                          params={"category":"linear","symbol":symbol.upper(),"interval":"1","limit":1},
                          timeout=REQUEST_TIMEOUT)
-        if mp.status_code == 200:
-            jm = mp.json()
+        if r2.status_code == 200:
+            jm = r2.json()
             rows = (jm.get("result") or {}).get("list") or []
             if rows and len(rows[0]) >= 5:
                 return to_float(rows[0][4])
-    except Exception as e:
-        logging.debug("Bybit price fallback error %s: %s", symbol, e)
+    except Exception:
+        pass
     return None
 
 def bybit_latest_funding(symbol: str) -> Optional[Dict[str, Any]]:
     try:
-        url = "https://api.bybit.com/v5/market/funding/history"
-        params = {"category": "linear", "symbol": symbol.upper(), "limit": 1}
-        r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        r = SESSION.get("https://api.bybit.com/v5/market/funding/history",
+                        params={"category":"linear","symbol":symbol.upper(),"limit":1},
+                        timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             j = r.json()
             rows = (j.get("result") or {}).get("list") or []
@@ -381,49 +421,37 @@ def bybit_latest_funding(symbol: str) -> Optional[Dict[str, Any]]:
                 rate = to_float(row.get("fundingRate"))
                 ts = int(row.get("fundingTime")) if row.get("fundingTime") else utc_ms_now()
                 price = fetch_bybit_mark_price(symbol.upper())
-                return {
-                    "exchange": "bybit",
-                    "symbol": symbol.upper(),
-                    "price": price,
-                    "rate_8h": rate,
-                    "next_funding_time": None,
-                    "ts": ts,
-                }
-    except Exception as e:
-        logging.debug("Bybit v5 error %s: %s", symbol, e)
+                return {"exchange":"bybit","symbol":symbol.upper(),"price":price,"rate_8h":rate,"next_funding_time":None,"ts":ts}
+    except Exception:
+        pass
     return None
 
+# OKX
 def okx_inst_id(symbol: str) -> str:
     s = symbol.upper()
-    if s.endswith("USDT"):
-        base = s[:-4]
-        return f"{base}-USDT-SWAP"
-    if s.endswith("USD"):
-        base = s[:-3]
-        return f"{base}-USD-SWAP"
+    if s.endswith("USDT"): return f"{s[:-4]}-USDT-SWAP"
+    if s.endswith("USD"):  return f"{s[:-3]}-USD-SWAP"
     return f"{s}-USDT-SWAP"
 
 def okx_mark_price(inst_id: str) -> Optional[float]:
     try:
-        url = "https://www.okx.com/api/v5/public/mark-price"
-        params = {"instType": "SWAP", "instId": inst_id}
-        r = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        r = SESSION.get("https://www.okx.com/api/v5/public/mark-price",
+                        params={"instType":"SWAP","instId":inst_id}, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             j = r.json()
             data = j.get("data") or []
             if data:
                 return to_float(data[0].get("markPx"))
-    except Exception as e:
-        logging.debug("OKX mark price error %s: %s", inst_id, e)
+    except Exception:
+        pass
     return None
 
 def okx_funding(symbol: str) -> Optional[Dict[str, Any]]:
     inst_id = okx_inst_id(symbol)
-    url = "https://www.okx.com/api/v5/public/funding-rate"
     try:
-        r = SESSION.get(url, params={"instId": inst_id}, timeout=REQUEST_TIMEOUT)
+        r = SESSION.get("https://www.okx.com/api/v5/public/funding-rate",
+                        params={"instId": inst_id}, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
-            logging.debug("OKX %s -> %s", inst_id, r.text[:200])
             return None
         j = r.json()
         data = j.get("data") or []
@@ -433,31 +461,15 @@ def okx_funding(symbol: str) -> Optional[Dict[str, Any]]:
         rate = to_float(d0.get("fundingRate"))
         next_time = int(d0.get("nextFundingTime")) if d0.get("nextFundingTime") else None
         price = okx_mark_price(inst_id)
-        return {
-            "exchange": "okx",
-            "symbol": symbol.upper(),
-            "instId": inst_id,
-            "price": price,
-            "rate_8h": rate,
-            "next_funding_time": next_time,
-            "ts": utc_ms_now(),
-        }
-    except Exception as e:
-        logging.debug("OKX error %s: %s", symbol, e)
+        return {"exchange":"okx","symbol":symbol.upper(),"instId":inst_id,"price":price,"rate_8h":rate,"next_funding_time":next_time,"ts":utc_ms_now()}
+    except Exception:
         return None
 
-# ------------------------------
-# Extra Exchanges
-# ------------------------------
-
-# --- MEXC ---
+# MEXC
 def mexc_symbol(symbol: str) -> str:
-    # BTCUSDT -> BTC_USDT
     s = symbol.upper()
-    if s.endswith("USDT"):
-        return f"{s[:-4]}_USDT"
-    if s.endswith("USD"):
-        return f"{s[:-3]}_USD"
+    if s.endswith("USDT"): return f"{s[:-4]}_USDT"
+    if s.endswith("USD"):  return f"{s[:-3]}_USD"
     return s.replace("-", "_")
 
 def mexc_mark_price(sym_native: str) -> Optional[float]:
@@ -467,13 +479,11 @@ def mexc_mark_price(sym_native: str) -> Optional[float]:
         if r.status_code == 200:
             j = r.json()
             data = (j.get("data") or {})
-            # sometimes 'data' is a list or dict depending on API version
             if isinstance(data, list) and data:
                 data = data[0]
-            px = to_float((data or {}).get("fair_price")) or to_float((data or {}).get("last_price"))
-            return px
-    except Exception as e:
-        logging.debug("MEXC price err %s: %s", sym_native, e)
+            return to_float((data or {}).get("fair_price")) or to_float((data or {}).get("last_price"))
+    except Exception:
+        pass
     return None
 
 def mexc_funding(symbol: str) -> Optional[Dict[str, Any]]:
@@ -487,25 +497,14 @@ def mexc_funding(symbol: str) -> Optional[Dict[str, Any]]:
         data = j.get("data") or {}
         rate = to_float(data.get("rate"))
         price = mexc_mark_price(sym_native)
-        # MEXC often lacks nextFundingTime in this endpoint
-        return {
-            "exchange": "mexc",
-            "symbol": symbol.upper(),
-            "price": price,
-            "rate_8h": rate,
-            "next_funding_time": None,
-            "ts": utc_ms_now(),
-        }
-    except Exception as e:
-        logging.debug("MEXC error %s: %s", symbol, e)
+        return {"exchange":"mexc","symbol":symbol.upper(),"price":price,"rate_8h":rate,"next_funding_time":None,"ts":utc_ms_now()}
+    except Exception:
         return None
 
-# --- KuCoin Futures ---
+# KuCoin Futures
 def kucoin_symbol(symbol: str) -> str:
-    # BTCUSDT -> BTCUSDTM (perp USDT margined)
     s = symbol.upper()
-    if s.endswith("USDT"):
-        return s + "M"
+    if s.endswith("USDT"): return s + "M"
     return s
 
 def kucoin_mark_price(sym_native: str) -> Optional[float]:
@@ -516,8 +515,8 @@ def kucoin_mark_price(sym_native: str) -> Optional[float]:
             j = r.json()
             d = j.get("data") or {}
             return to_float(d.get("value"))
-    except Exception as e:
-        logging.debug("KuCoin price err %s: %s", sym_native, e)
+    except Exception:
+        pass
     return None
 
 def kucoin_funding(symbol: str) -> Optional[Dict[str, Any]]:
@@ -532,21 +531,12 @@ def kucoin_funding(symbol: str) -> Optional[Dict[str, Any]]:
         rate = to_float(d.get("fundingRate"))
         next_time = int(d.get("nextFundingTime")) if d.get("nextFundingTime") else None
         price = kucoin_mark_price(sym_native)
-        return {
-            "exchange": "kucoin",
-            "symbol": symbol.upper(),
-            "price": price,
-            "rate_8h": rate,
-            "next_funding_time": next_time,
-            "ts": utc_ms_now(),
-        }
-    except Exception as e:
-        logging.debug("KuCoin error %s: %s", symbol, e)
+        return {"exchange":"kucoin","symbol":symbol.upper(),"price":price,"rate_8h":rate,"next_funding_time":next_time,"ts":utc_ms_now()}
+    except Exception:
         return None
 
-# --- Deribit ---
+# Deribit
 def deribit_symbol(symbol: str) -> str:
-    # BTCUSDT -> BTC-PERPETUAL (Deribit is USD-settled)
     base = symbol.upper().replace("USDT","").replace("USD","")
     return f"{base}-PERPETUAL"
 
@@ -558,8 +548,8 @@ def deribit_mark_price(inst: str) -> Optional[float]:
             j = r.json()
             d = (j.get("result") or {})
             return to_float(d.get("mark_price"))
-    except Exception as e:
-        logging.debug("Deribit price err %s: %s", inst, e)
+    except Exception:
+        pass
     return None
 
 def deribit_funding(symbol: str) -> Optional[Dict[str, Any]]:
@@ -571,29 +561,17 @@ def deribit_funding(symbol: str) -> Optional[Dict[str, Any]]:
             return None
         j = r.json()
         d = j.get("result") or {}
-        # Deribit returns hourly or 8h? We'll assume 8h-equivalent; if hourly, library annualize may differ.
-        rate = to_float(d.get("data"))  # expected as rate per 8h; if hourly, values are smaller.
+        rate = to_float(d.get("data"))  # трактуем как 8h (некоторые инсталляции отдают hourly — учти при анализе)
         price = deribit_mark_price(inst)
-        return {
-            "exchange": "deribit",
-            "symbol": symbol.upper(),
-            "price": price,
-            "rate_8h": rate,
-            "next_funding_time": None,
-            "ts": utc_ms_now(),
-        }
-    except Exception as e:
-        logging.debug("Deribit error %s: %s", symbol, e)
+        return {"exchange":"deribit","symbol":symbol.upper(),"price":price,"rate_8h":rate,"next_funding_time":None,"ts":utc_ms_now()}
+    except Exception:
         return None
 
-# --- Bitget ---
+# Bitget
 def bitget_symbol(symbol: str) -> str:
-    # BTCUSDT -> BTCUSDT_UMCBL (USDT-margined perpetual)
     s = symbol.upper()
-    if s.endswith("USDT"):
-        return f"{s}_UMCBL"
-    if s.endswith("USD"):
-        return f"{s}_DMCBL"
+    if s.endswith("USDT"): return f"{s}_UMCBL"
+    if s.endswith("USD"):  return f"{s}_DMCBL"
     return s + "_UMCBL"
 
 def bitget_mark_price(sym_native: str) -> Optional[float]:
@@ -604,8 +582,8 @@ def bitget_mark_price(sym_native: str) -> Optional[float]:
             j = r.json()
             d = (j.get("data") or {})
             return to_float(d.get("markPrice"))
-    except Exception as e:
-        logging.debug("Bitget price err %s: %s", sym_native, e)
+    except Exception:
+        pass
     return None
 
 def bitget_funding(symbol: str) -> Optional[Dict[str, Any]]:
@@ -620,46 +598,33 @@ def bitget_funding(symbol: str) -> Optional[Dict[str, Any]]:
         rate = to_float(d.get("fundingRate"))
         next_time = int(d.get("nextSettleTime")) if d.get("nextSettleTime") else None
         price = bitget_mark_price(sym_native)
-        return {
-            "exchange": "bitget",
-            "symbol": symbol.upper(),
-            "price": price,
-            "rate_8h": rate,
-            "next_funding_time": next_time,
-            "ts": utc_ms_now(),
-        }
-    except Exception as e:
-        logging.debug("Bitget error %s: %s", symbol, e)
+        return {"exchange":"bitget","symbol":symbol.upper(),"price":price,"rate_8h":rate,"next_funding_time":next_time,"ts":utc_ms_now()}
+    except Exception:
         return None
 
-# --- Gate.io Perps (USDT) ---
+# Gate
 def gate_symbol(symbol: str) -> str:
-    # BTCUSDT -> BTC_USDT
     s = symbol.upper()
-    if s.endswith("USDT"):
-        return f"{s[:-4]}_USDT"
-    if s.endswith("USD"):
-        return f"{s[:-3]}_USD"
+    if s.endswith("USDT"): return f"{s[:-4]}_USDT"
+    if s.endswith("USD"):  return f"{s[:-3]}_USD"
     return s.replace("-", "_")
 
 def gate_mark_price(sym_native: str) -> Optional[float]:
     try:
-        # futures/usdt/tickers returns mark_price field per contract
-        r = SESSION.get(f"https://api.gateio.ws/api/v4/futures/usdt/tickers",
+        r = SESSION.get("https://api.gateio.ws/api/v4/futures/usdt/tickers",
                         params={"contract": sym_native}, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             arr = r.json()
             if isinstance(arr, list) and arr:
                 d = arr[0]
                 return to_float(d.get("mark_price")) or to_float(d.get("last"))
-    except Exception as e:
-        logging.debug("Gate price err %s: %s", sym_native, e)
+    except Exception:
+        pass
     return None
 
 def gate_funding(symbol: str) -> Optional[Dict[str, Any]]:
     try:
         sym_native = gate_symbol(symbol)
-        # funding rate endpoint:
         r = SESSION.get("https://api.gateio.ws/api/v4/futures/usdt/funding_rate",
                         params={"contract": sym_native}, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
@@ -669,21 +634,12 @@ def gate_funding(symbol: str) -> Optional[Dict[str, Any]]:
         rate = to_float(d.get("funding_rate"))
         next_time = int(d.get("next_funding_time"))*1000 if d.get("next_funding_time") else None
         price = gate_mark_price(sym_native)
-        return {
-            "exchange": "gate",
-            "symbol": symbol.upper(),
-            "price": price,
-            "rate_8h": rate,
-            "next_funding_time": next_time,
-            "ts": utc_ms_now(),
-        }
-    except Exception as e:
-        logging.debug("Gate error %s: %s", symbol, e)
+        return {"exchange":"gate","symbol":symbol.upper(),"price":price,"rate_8h":rate,"next_funding_time":next_time,"ts":utc_ms_now()}
+    except Exception:
         return None
 
-# --- Phemex ---
+# Phemex
 def phemex_symbol(symbol: str) -> str:
-    # BTCUSDT -> BTCUSDT
     return symbol.upper()
 
 def phemex_mark_price(sym_native: str) -> Optional[float]:
@@ -697,9 +653,11 @@ def phemex_mark_price(sym_native: str) -> Optional[float]:
                 d = d.get("tickers") or []
             if isinstance(d, list) and d:
                 item = d[0]
-                return to_float(item.get("markPriceEp")) and (to_float(item.get("markPriceEp"))/1e4)
-    except Exception as e:
-        logging.debug("Phemex price err %s: %s", sym_native, e)
+                ep = to_float(item.get("markPriceEp"))
+                if ep is not None:
+                    return ep/1e4
+    except Exception:
+        pass
     return None
 
 def phemex_funding(symbol: str) -> Optional[Dict[str, Any]]:
@@ -711,55 +669,39 @@ def phemex_funding(symbol: str) -> Optional[Dict[str, Any]]:
             return None
         j = r.json()
         d = (j.get("result") or {})
-        rate = to_float(d.get("fundingRate"))  # per 8h
+        rate = to_float(d.get("fundingRate"))
         next_time = int(d.get("timestamp")) if d.get("timestamp") else None
         price = phemex_mark_price(sym_native)
-        return {
-            "exchange": "phemex",
-            "symbol": symbol.upper(),
-            "price": price,
-            "rate_8h": rate,
-            "next_funding_time": next_time,
-            "ts": utc_ms_now(),
-        }
-    except Exception as e:
-        logging.debug("Phemex error %s: %s", symbol, e)
+        return {"exchange":"phemex","symbol":symbol.upper(),"price":price,"rate_8h":rate,"next_funding_time":next_time,"ts":utc_ms_now()}
+    except Exception:
         return None
 
-# --- Kraken Futures ---
+# Kraken Futures
 def krakenf_symbol(symbol: str) -> str:
-    # Kraken Futures often uses 'PI_XBTUSD' (XBT not BTC) for perpetual USD; for USDT: 'PI_XBTUSDT'
     base = symbol.upper().replace("BTC","XBT")
-    if base.endswith("USDT"):
-        return f"PI_{base[:-4]}USDT"
-    if base.endswith("USD"):
-        return f"PI_{base[:-3]}USD"
+    if base.endswith("USDT"): return f"PI_{base[:-4]}USDT"
+    if base.endswith("USD"):  return f"PI_{base[:-3]}USD"
     return f"PI_{base}USD"
 
 def krakenf_mark_price(sym_native: str) -> Optional[float]:
     try:
-        # instruments endpoint has mark prices; fallback to tickers
-        r = SESSION.get("https://futures.kraken.com/derivatives/api/v3/tickers",
-                        timeout=REQUEST_TIMEOUT)
+        r = SESSION.get("https://futures.kraken.com/derivatives/api/v3/tickers", timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
-            j = r.json()
-            arr = (j.get("tickers") or [])
+            arr = (r.json().get("tickers") or [])
             for it in arr:
                 if it.get("symbol") == sym_native:
                     return to_float(it.get("markPrice"))
-    except Exception as e:
-        logging.debug("KrakenF price err %s: %s", sym_native, e)
+    except Exception:
+        pass
     return None
 
 def krakenf_funding(symbol: str) -> Optional[Dict[str, Any]]:
     try:
         sym_native = krakenf_symbol(symbol)
-        r = SESSION.get("https://futures.kraken.com/derivatives/api/v3/funding-rates",
-                        timeout=REQUEST_TIMEOUT)
+        r = SESSION.get("https://futures.kraken.com/derivatives/api/v3/funding-rates", timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
             return None
-        j = r.json()
-        arr = (j.get("instruments") or [])
+        arr = (r.json().get("instruments") or [])
         rate = None
         next_ts = None
         for it in arr:
@@ -770,20 +712,12 @@ def krakenf_funding(symbol: str) -> Optional[Dict[str, Any]]:
         if rate is None:
             return None
         price = krakenf_mark_price(sym_native)
-        return {
-            "exchange": "krakenf",
-            "symbol": symbol.upper(),
-            "price": price,
-            "rate_8h": rate,
-            "next_funding_time": next_ts,
-            "ts": utc_ms_now(),
-        }
-    except Exception as e:
-        logging.debug("KrakenF error %s: %s", symbol, e)
+        return {"exchange":"krakenf","symbol":symbol.upper(),"price":price,"rate_8h":rate,"next_funding_time":next_ts,"ts":utc_ms_now()}
+    except Exception:
         return None
 
 # ------------------------------
-# Binance Top‑N symbols util
+# Binance Top symbols util
 # ------------------------------
 def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List[str]:
     try:
@@ -816,6 +750,10 @@ def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List
 # ------------------------------
 # Scan
 # ------------------------------
+DEFAULT_EXCHANGES = ["binance","bybit","okx"]
+DEFAULT_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","BNBUSDT","LINKUSDT","ADAUSDT","TONUSDT","OPUSDT","ARBUSDT","PEPEUSDT"]
+COMMON_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","LINKUSDT","BNBUSDT","ADAUSDT"]
+
 def scan_all(exchanges: List[str], symbols: List[str]) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for ex in exchanges:
@@ -855,19 +793,263 @@ def scan_all(exchanges: List[str], symbols: List[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ------------------------------
-# Main (совместим с твоим)
+# Availability Matrix (встроено)
+# ------------------------------
+def _std_from_binance(sym: str) -> str: return sym.upper()
+def _std_from_underscore(s: str) -> str:
+    s = s.upper().replace("-", "_")
+    if "_" in s:
+        a,b=s.split("_",1)
+        return a+b
+    return s
+def _std_from_suffix(s: str, suf: str) -> str:
+    s = s.upper()
+    if s.endswith(suf.upper()): return s[:-len(suf)]
+    return s
+def _std_from_kucoin(s: str) -> str: return s[:-1] if s.upper().endswith("M") else s.upper()
+def _std_from_okx_inst(inst: str) -> Optional[str]:
+    inst = inst.upper(); parts = inst.split("-")
+    if len(parts)>=3 and parts[-1]=="SWAP": return parts[0]+parts[1]
+    return None
+def _std_from_krakenf(sym: str) -> Optional[str]:
+    s = sym.upper()
+    if not s.startswith("PI_"): return None
+    s = s[3:].replace("XBT","BTC")
+    return s
+def _std_from_deribit(inst: str) -> Optional[str]:
+    inst = inst.upper()
+    if inst.endswith("-PERPETUAL"): return inst.replace("-PERPETUAL","")+"USD"
+    return None
+
+def list_binance_perp_usdt() -> Set[str]:
+    r = SESSION.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    out=set()
+    for s in r.json().get("symbols", []):
+        if s.get("contractType")=="PERPETUAL" and s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING":
+            out.add(_std_from_binance(s.get("symbol","")))
+    return out
+
+def lister_bybit() -> Set[str]:
+    r = SESSION.get("https://api.bybit.com/v5/market/instruments-info", params={"category":"linear"}, timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    out=set()
+    for it in (r.json().get("result") or {}).get("list") or []:
+        sym=(it.get("symbol") or "").upper()
+        if sym.endswith("USDT"): out.add(sym)
+    return out
+
+def lister_okx() -> Set[str]:
+    r = SESSION.get("https://www.okx.com/api/v5/public/instruments", params={"instType":"SWAP"}, timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    out=set()
+    for it in (r.json().get("data") or []):
+        std=_std_from_okx_inst(it.get("instId",""))
+        if std and (std.endswith("USDT") or std.endswith("USD")): out.add(std)
+    return out
+
+def lister_mexc() -> Set[str]:
+    r = SESSION.get("https://contract.mexc.com/api/v1/contract/detail", timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    out=set()
+    for it in (r.json().get("data") or []):
+        std=_std_from_underscore(it.get("symbol",""))
+        if std.endswith("USDT") or std.endswith("USD"): out.add(std)
+    return out
+
+def lister_kucoin() -> Set[str]:
+    r = SESSION.get("https://api-futures.kucoin.com/api/v1/contracts/active", timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    out=set()
+    for it in (r.json().get("data") or []):
+        std=_std_from_kucoin(it.get("symbol",""))
+        if std.endswith("USDT") or std.endswith("USD"): out.add(std)
+    return out
+
+def lister_bitget() -> Set[str]:
+    r = SESSION.get("https://api.bitget.com/api/mix/v1/market/contracts", params={"productType":"umcbl"}, timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    out=set()
+    for it in (r.json().get("data") or []):
+        std=_std_from_suffix(it.get("symbol",""), "_UMCBL")
+        if std.endswith("USDT"): out.add(std)
+    return out
+
+def lister_gate() -> Set[str]:
+    r = SESSION.get("https://api.gateio.ws/api/v4/futures/usdt/contracts", timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    out=set()
+    for it in r.json():
+        std=_std_from_underscore(it.get("name",""))
+        if std.endswith("USDT"): out.add(std)
+    return out
+
+def lister_phemex() -> Set[str]:
+    r = SESSION.get("https://api.phemex.com/exchange/public/products", timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    j=r.json()
+    rows: Optional[List[AnyT]] = None
+    if isinstance(j, dict):
+        data=j.get("data")
+        if isinstance(data, dict):
+            rows=data.get("products")
+        elif isinstance(data, list):
+            rows=data
+        else:
+            rows=j.get("products") or j.get("result")
+    elif isinstance(j, list):
+        rows=j
+    out=set()
+    if not rows: return out
+    for it in rows:
+        try:
+            sym=str(it.get("symbol","")).upper()
+            typ=it.get("type") or it.get("contractType") or ""
+            if isinstance(typ,str) and "perpet" in typ.lower():
+                out.add(sym)
+        except Exception:
+            continue
+    return out
+
+def lister_krakenf() -> Set[str]:
+    r = SESSION.get("https://futures.kraken.com/derivatives/api/v3/instruments", timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    out=set()
+    for it in (r.json().get("instruments") or []):
+        std=_std_from_krakenf(it.get("symbol",""))
+        if std and (std.endswith("USDT") or std.endswith("USD")): out.add(std)
+    return out
+
+def lister_deribit() -> Set[str]:
+    out=set()
+    for cur in ["BTC","ETH"]:
+        r = SESSION.get("https://www.deribit.com/api/v2/public/get_instruments",
+                        params={"currency":cur,"kind":"future","expired":"false"},
+                        timeout=REQUEST_TIMEOUT); r.raise_for_status()
+        for it in (r.json().get("result") or []):
+            if it.get("settlement_period")=="perpetual":
+                std=_std_from_deribit(it.get("instrument_name",""))
+                if std: out.add(std)
+    return out
+
+LISTERS = {
+    "binance": list_binance_perp_usdt,
+    "bybit":   lister_bybit,
+    "okx":     lister_okx,
+    "mexc":    lister_mexc,
+    "kucoin":  lister_kucoin,
+    "bitget":  lister_bitget,
+    "gate":    lister_gate,
+    "phemex":  lister_phemex,
+    "krakenf": lister_krakenf,
+    "deribit": lister_deribit,
+}
+
+def build_availability_matrix(
+    exchanges: List[str],
+    universe_mode: str = "common",         # common | binance-top | union | manual
+    manual_symbols: Optional[List[str]] = None,
+    top_n: int = 200,
+    min_quote: float = 10_000_000,
+    sleep_ms: int = 250
+) -> pd.DataFrame:
+    exchanges = [e.lower().strip() for e in exchanges if e.strip()]
+    for e in exchanges:
+        if e not in LISTERS:
+            raise ValueError(f"Unsupported exchange: {e}")
+
+    avail: Dict[str, Set[str]] = {}
+    for i, ex in enumerate(exchanges):
+        try:
+            avail[ex] = LISTERS[ex]()
+        except Exception as ex_err:
+            logging.warning("Failed to list %s: %s", ex, ex_err)
+            avail[ex] = set()
+        if sleep_ms and i < len(exchanges)-1:
+            time.sleep(sleep_ms/1000.0)
+
+    if universe_mode == "common":
+        universe = set(COMMON_SYMBOLS)
+    elif universe_mode == "binance-top":
+        try:
+            top = binance_top_perp_usdt(top_n=top_n, min_quote_usdt=min_quote)
+            universe = set(top)
+        except Exception as ex_err:
+            logging.warning("binance-top failed; fallback to COMMON: %s", ex_err)
+            universe = set(COMMON_SYMBOLS)
+    elif universe_mode == "union":
+        universe = set()
+        for s in avail.values():
+            universe |= s
+    elif universe_mode == "manual":
+        if not manual_symbols:
+            raise ValueError("manual universe requires manual_symbols")
+        universe = set([x.strip().upper() for x in manual_symbols if x.strip()])
+    else:
+        raise ValueError("universe must be one of: common | binance-top | union | manual")
+
+    rows = []
+    for sym in sorted(universe):
+        row = {"symbol": sym}
+        cnt = 0
+        for ex in exchanges:
+            has = sym in avail.get(ex, set())
+            row[ex] = bool(has)
+            if has: cnt += 1
+        row["listed_on"] = cnt
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df = df[["symbol"] + exchanges + ["listed_on"]]
+    df = df.sort_values(["listed_on","symbol"], ascending=[False, True]).reset_index(drop=True)
+    return df
+
+def run_matrix_from_env() -> Optional[pd.DataFrame]:
+    ex_env = getenv_str("MATRIX_EXCHANGES", "")
+    save_path = getenv_str("MATRIX_SAVE_PATH", "")
+    if not ex_env:
+        return None
+    exchanges = [x.strip() for x in ex_env.split(",") if x.strip()]
+    universe = getenv_str("MATRIX_UNIVERSE", "common").lower()
+    symbols_env = getenv_str("MATRIX_SYMBOLS", "")
+    manual_symbols = [x.strip() for x in symbols_env.split(",")] if (universe=="manual" and symbols_env) else None
+    top_n = int(getenv_float("MATRIX_TOP_N", 200))
+    min_quote = float(getenv_float("MATRIX_MIN_QUOTE", 10_000_000))
+    sleep_ms = int(getenv_float("MATRIX_SLEEP_MS", 250))
+
+    logging.info("Building availability matrix: exchanges=%s | universe=%s", ",".join(exchanges), universe)
+    df = build_availability_matrix(exchanges, universe, manual_symbols, top_n, min_quote, sleep_ms)
+
+    try:
+        print(df.to_string(index=False))
+    except Exception:
+        print(df.head().to_string(index=False))
+
+    if save_path:
+        p = bucketize_path(save_path)
+        if is_gs(p):
+            try:
+                gcs_write_csv(p, df)
+                logging.info("Matrix saved to %s", p)
+            except Exception as e:
+                logging.warning("Failed to save matrix to GCS: %s", e)
+        else:
+            try:
+                df.to_csv(p, index=False)
+                logging.info("Matrix saved to %s", p)
+            except Exception as e:
+                logging.warning("Failed to save matrix to file: %s", e)
+    return df
+
+# ------------------------------
+# Main
 # ------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--noop", action="store_true", help="No-op, everything via ENV")
-    ap.parse_args()
+    ap.add_argument("--noop", action="store_true")
+    args = ap.parse_args()
 
     exchanges = [x.lower() for x in getenv_list("EXCHANGES", DEFAULT_EXCHANGES)]
     symbols_source = getenv_str("SYMBOLS_SOURCE", "binance-top").lower()
     symbols = [x.upper() for x in getenv_list("SYMBOLS", DEFAULT_SYMBOLS)]
     top_n = int(getenv_float("TOP_N", 200))
     min_quote_usdt = float(getenv_float("MIN_QUOTE_USDT", 10_000_000))
-    save_symbols_path = getenv_str("SAVE_SYMBOLS_PATH", "")
+
+    # Paths (with BACKET auto-prefix for relative paths)
+    raw_csv_path = bucketize_path(getenv_str("RAW_CSV_PATH", ""))
+    log_csv_path = bucketize_path(getenv_str("LOG_CSV_PATH", "signals_log.csv"))
+    positions_csv_path = bucketize_path(getenv_str("POSITIONS_CSV_PATH", "positions.csv"))
 
     entry_apr = float(getenv_float("ENTRY_APR", 15.0))
     exit_apr  = float(getenv_float("EXIT_APR", 8.0))
@@ -898,206 +1080,218 @@ def main():
     rotate = getenv_bool("ROTATE", False)
     rotate_delta_usd = float(getenv_float("ROTATE_DELTA_USD", 0.0))
 
-    raw_csv_path = getenv_str("RAW_CSV_PATH", "")
-    log_csv_path = getenv_str("LOG_CSV_PATH", "signals_log.csv")
-    positions_csv_path = getenv_str("POSITIONS_CSV_PATH", "positions.csv")
-
+    # Effective notional per leg
     if notional is not None:
         eff_notional = float(notional)
     else:
         eff_notional = leg_notional_from_capital(capital, perp_leverage)
-    logging.info("Effective per-leg notional = $%.2f (capital=%.2f, leverage=%.2f)",
-                 eff_notional, capital, perp_leverage)
+    logging.info("Effective per-leg notional = $%.2f (capital=%.2f, leverage=%.2f)", eff_notional, capital, perp_leverage)
 
+    # SYMBOLS
     if symbols_source == "binance-top":
-        logging.info("Building symbols from Binance top-%s by 24h quote volume (min %s USDT)...",
-                     top_n, min_quote_usdt)
+        logging.info("Building symbols from Binance top-%s by 24h quote volume (min %s USDT)...", top_n, min_quote_usdt)
         symbols = binance_top_perp_usdt(top_n=top_n, min_quote_usdt=min_quote_usdt) or symbols
         logging.info("Got %d symbols. First 10: %s", len(symbols), " ".join(symbols[:10]))
-        if save_symbols_path:
-            try:
-                if save_symbols_path.startswith("gs://"):
-                    from io import StringIO
-                    buf = StringIO()
-                    buf.write("\n".join(symbols) + "\n")
-                    client = gcs_client()
-                    bucket, blob = gcs_split(save_symbols_path)
-                    bkt = client.lookup_bucket(bucket)
-                    if bkt is None:
-                        raise FileNotFoundError(f"Bucket '{bucket}' not found or access denied")
-                    bkt.blob(blob).upload_from_string(buf.getvalue(), content_type="text/plain")
-                else:
-                    with open(save_symbols_path, "w") as f:
-                        for s in symbols: f.write(s+"\n")
-                logging.info("Saved symbols to %s", save_symbols_path)
-            except Exception as e:
-                logging.warning("save-symbols error: %s", e)
+    elif symbols_source == "common":
+        symbols = COMMON_SYMBOLS
+        logging.info("Using COMMON symbols: %s", ",".join(symbols))
+    elif symbols_source == "manual":
+        logging.info("Using MANUAL symbols: %s", ",".join(symbols))
+    else:
+        logging.info("Unknown SYMBOLS_SOURCE=%s, using defaults", symbols_source)
 
+    # Scan
     df = scan_all(exchanges, symbols)
-    if df.empty:
-        print("No data rows.")
-        return
-
-    gross_day, fees_day, borrow_day, net_day = [], [], [], []
-    hold_days = max(1.0/24.0, expected_holding_h/24.0)
-    fees_total = 4.0 * taker_fee * eff_notional  # entry+exit, spot+perp
-    fees_day_amort = fees_total / hold_days
-
-    for _, row in df.iterrows():
-        r8 = row.get("rate_8h") or 0.0
-        g = 3.0 * float(r8) * eff_notional
-        b = daily_borrow_cost_usd(eff_notional, borrow_apr) if row["direction"] == "LONG_PERP_SHORT_SPOT" else 0.0
-        gross_day.append(g)
-        fees_day.append(fees_day_amort)
-        borrow_day.append(b)
-        net_day.append(g - fees_day_amort - b)
-
-    df["gross_day_usd"] = gross_day
-    df["fees_day_usd"]  = fees_day
-    df["borrow_day_usd"] = borrow_day
-    df["net_day_usd"]   = net_day
-
-    df = df[(~df["price"].isna()) & (df["price"] >= MIN_PRICE)]
-
-    if raw_csv_path:
-        append_csv(raw_csv_path, df)
-
-    pos_cols = ["exchange","symbol","direction","entry_time_utc","entry_ts","entry_rate_8h","entry_apr_pct","entry_price","notional_usd","net_day_usd"]
-    positions = read_csv(positions_csv_path, pos_cols)
-
-    log_cols = ["time_utc","action","exchange","symbol","direction","rate_8h","apr_pct","price","notional_usd","payout_8h_usd","payout_day_usd","reason"]
-    batch_logs = []
-
-    def current_row(ex, sym) -> Optional[pd.Series]:
-        sub = df[(df["exchange"]==ex) & (df["symbol"]==sym)]
-        if sub.empty: return None
-        return sub.iloc[0]
-
-    now_ms = utc_ms_now()
-    now_utc = fmt_ts(now_ms)
-
-    to_remove_idx = []
-    for i, pos in positions.iterrows():
-        ex, sym, dir_ = pos["exchange"], pos["symbol"], pos["direction"]
-        entry_ts = pos["entry_ts"]
-        cr = current_row(ex, sym)
-        if cr is None:
-            logging.debug("No fresh row for %s %s", ex, sym)
-            continue
-
-        apr_abs = abs(cr["apr_pct"]) if cr["apr_pct"] is not None else None
-        sign_flip = cr["direction"] != dir_ and cr["direction"] in ["SHORT_PERP_LONG_SPOT","LONG_PERP_SHORT_SPOT"]
-        holding_h = None
-        if entry_ts:
-            holding_h = round((now_ms - int(entry_ts)) / (1000*3600), 2)
-
-        reason = None
-        if apr_abs is not None and apr_abs < exit_apr:
-            reason = f"APR {apr_abs}% < exit {exit_apr}%"
-        if reason is None and holding_h is not None and holding_h >= max_holding_h:
-            reason = f"Max holding {holding_h}h ≥ {max_holding_h}h"
-        if reason is None and sign_flip:
-            reason = f"Direction flip {dir_} -> {cr['direction']}"
-
-        if reason:
-            payout8 = payout_8h_usd(cr["rate_8h"], eff_notional)
-            payoutd = payout_day_usd(cr["rate_8h"], eff_notional)
-            batch_logs.append({
-                "time_utc": now_utc, "action":"CLOSE",
-                "exchange": ex, "symbol": sym, "direction": dir_,
-                "rate_8h": cr["rate_8h"], "apr_pct": cr["apr_pct"], "price": cr["price"],
-                "notional_usd": eff_notional, "payout_8h_usd": payout8, "payout_day_usd": payoutd,
-                "reason": reason
-            })
-            msg = (f"✅ <b>Funding CLOSE</b>\n"
-                   f"{ex.upper()} {sym}\n"
-                   f"APR: {cr['apr_pct']}% | 8h: {round((cr['rate_8h'] or 0)*100,6)}%\n"
-                   f"Dir: {dir_}\nReason: {reason}")
-            maybe_send_telegram(msg)
-            to_remove_idx.append(i)
-
-    if to_remove_idx:
-        positions = positions.drop(index=to_remove_idx).reset_index(drop=True)
-
-    candidates = df.copy()
-    candidates = candidates[
-        (candidates["apr_pct"].abs() >= entry_apr) &
-        (candidates["net_day_usd"] > MIN_NET_DAY_USD)
-    ]
-    candidates = candidates.sort_values("net_day_usd", ascending=False)
-
-    top_n_tg = max(0, int(top_n_tg))
-    if top_n_tg > 0 and not candidates.empty:
-        publish_rows = candidates.iloc[1:1+top_n_tg] if len(candidates) > 1 else pd.DataFrame(columns=candidates.columns)
-        for _, r in publish_rows.iterrows():
-            if r["price"] is None or r["price"] < MIN_PRICE:
-                continue
-            qty = hedge_qty(eff_notional, r["price"])
-            nf = r.get("next_funding_utc") or "n/a"
-            card = format_open_card(r["exchange"], r["symbol"], r, qty, nf,
-                                    r["net_day_usd"], r["gross_day_usd"], r["fees_day_usd"], r["borrow_day_usd"])
-            maybe_send_telegram(card)
-
-    current_pos = positions.iloc[0] if len(positions) > 0 else None
-    best = candidates.head(1)
-    if not best.empty:
-        r = best.iloc[0]
-        ex, sym, dir_ = r["exchange"], r["symbol"], r["direction"]
-
-        need_open = current_pos is None
-        if current_pos is not None:
-            same = (str(current_pos["exchange"]).lower() == ex) and (str(current_pos["symbol"]).upper() == sym)
-            if same:
-                need_open = False
-            else:
-                current_net = 0.0 if pd.isna(current_pos.get("net_day_usd", None)) else float(current_pos.get("net_day_usd", 0.0))
-                delta_usd = float(r["net_day_usd"] or 0.0) - current_net
-                if rotate and delta_usd > float(rotate_delta_usd):
-                    close_msg = (f"🔁 <b>Funding ROTATE</b>\n"
-                                 f"Close: {str(current_pos['exchange']).upper()} {str(current_pos['symbol']).upper()}\n"
-                                 f"Open:  {ex.upper()} {sym}\n"
-                                 f"Delta net/day: ${round2(delta_usd)}")
-                    maybe_send_telegram(close_msg)
-                    positions = positions.iloc[0:0]
-                    need_open = True
-                else:
-                    need_open = False
-
-        if need_open and (r["price"] is not None) and (r["price"] >= MIN_PRICE):
-            entry_qty = hedge_qty(eff_notional, r["price"])
-            payout8 = payout_8h_usd(r["rate_8h"], eff_notional)
-            payoutd = r["gross_day_usd"]
-            nf = r.get("next_funding_utc") or "n/a"
-
-            card = format_open_card(ex, sym, r, entry_qty, nf,
-                                    r["net_day_usd"], r["gross_day_usd"], r["fees_day_usd"], r["borrow_day_usd"])
-            maybe_send_telegram(card)
-
-            new_pos = {
-                "exchange": ex, "symbol": sym, "direction": dir_,
-                "entry_time_utc": r["time_utc"], "entry_ts": r["ts"],
-                "entry_rate_8h": r["rate_8h"], "entry_apr_pct": r["apr_pct"],
-                "entry_price": r["price"], "notional_usd": eff_notional,
-                "net_day_usd": r["net_day_usd"]
-            }
-            positions = pd.DataFrame([new_pos], columns=list(new_pos.keys()))
-            batch_logs.append({
-                "time_utc": now_utc, "action":"OPEN",
-                "exchange": ex, "symbol": sym, "direction": dir_,
-                "rate_8h": r["rate_8h"], "apr_pct": r["apr_pct"], "price": r["price"],
-                "notional_usd": eff_notional, "payout_8h_usd": payout8, "payout_day_usd": payoutd,
-                "reason": "best net/day"
-            })
-
-    write_csv(positions_csv_path, positions)
-    if batch_logs:
-        append_csv(log_csv_path, pd.DataFrame(batch_logs))
-
     if not df.empty:
-        printable = df[["exchange","symbol","price","rate_8h","rate_8h_pct","apr_pct","net_day_usd","time_utc","next_funding_utc","direction"]]
-        print(printable.to_string(index=False))
+        # Costs/PNL metrics
+        gross_day, fees_day, borrow_day, net_day = [], [], [], []
+        hold_days = max(1.0/24.0, expected_holding_h/24.0)
+        fees_total = 4.0 * taker_fee * eff_notional  # entry+exit, spot+perp
+        fees_day_amort = fees_total / hold_days
+
+        for _, row in df.iterrows():
+            r8 = row.get("rate_8h") or 0.0
+            g = 3.0 * float(r8) * eff_notional
+            b = daily_borrow_cost_usd(eff_notional, borrow_apr) if row["direction"] == "LONG_PERP_SHORT_SPOT" else 0.0
+            gross_day.append(g)
+            fees_day.append(fees_day_amort)
+            borrow_day.append(b)
+            net_day.append(g - fees_day_amort - b)
+
+        df["gross_day_usd"] = gross_day
+        df["fees_day_usd"]  = fees_day
+        df["borrow_day_usd"] = borrow_day
+        df["net_day_usd"]   = net_day
+
+        df = df[(~df["price"].isna()) & (df["price"] >= MIN_PRICE)]
+
+        if raw_csv_path:
+            append_csv(raw_csv_path, df)
+
+        # Positions & signals
+        pos_cols = ["exchange","symbol","direction","entry_time_utc","entry_ts","entry_rate_8h","entry_apr_pct","entry_price","notional_usd","net_day_usd"]
+        positions = read_csv(positions_csv_path, pos_cols)
+
+        log_cols = ["time_utc","action","exchange","symbol","direction","rate_8h","apr_pct","price","notional_usd","payout_8h_usd","payout_day_usd","reason"]
+        batch_logs = []
+
+        def current_row(ex, sym) -> Optional[pd.Series]:
+            sub = df[(df["exchange"]==ex) & (df["symbol"]==sym)]
+            if sub.empty: return None
+            return sub.iloc[0]
+
+        now_ms = utc_ms_now()
+        now_utc = fmt_ts(now_ms)
+
+        to_remove_idx = []
+        for i, pos in positions.iterrows():
+            ex, sym, dir_ = pos["exchange"], pos["symbol"], pos["direction"]
+            entry_ts = pos["entry_ts"]
+            cr = current_row(ex, sym)
+            if cr is None:
+                continue
+
+            apr_abs = abs(cr["apr_pct"]) if cr["apr_pct"] is not None else None
+            sign_flip = cr["direction"] != dir_ and cr["direction"] in ["SHORT_PERP_LONG_SPOT","LONG_PERP_SHORT_SPOT"]
+            holding_h = None
+            if entry_ts:
+                holding_h = round((now_ms - int(entry_ts)) / (1000*3600), 2)
+
+            reason = None
+            if apr_abs is not None and apr_abs < exit_apr:
+                reason = f"APR {apr_abs}% < exit {exit_apr}%"
+            if reason is None and holding_h is not None and holding_h >= max_holding_h:
+                reason = f"Max holding {holding_h}h ≥ {max_holding_h}h"
+            if reason is None and sign_flip:
+                reason = f"Direction flip {dir_} -> {cr['direction']}"
+
+            if reason:
+                payout8 = payout_8h_usd(cr["rate_8h"], eff_notional)
+                payoutd = payout_day_usd(cr["rate_8h"], eff_notional)
+                batch_logs.append({
+                    "time_utc": now_utc, "action":"CLOSE",
+                    "exchange": ex, "symbol": sym, "direction": dir_,
+                    "rate_8h": cr["rate_8h"], "apr_pct": cr["apr_pct"], "price": cr["price"],
+                    "notional_usd": eff_notional, "payout_8h_usd": payout8, "payout_day_usd": payoutd,
+                    "reason": reason
+                })
+                msg = (f"✅ <b>Funding CLOSE</b>\n"
+                       f"{ex.upper()} {sym}\n"
+                       f"APR: {cr['apr_pct']}% | 8h: {round((cr['rate_8h'] or 0)*100,6)}%\n"
+                       f"Dir: {dir_}\nReason: {reason}")
+                maybe_send_telegram(msg)
+                to_remove_idx.append(i)
+
+        if to_remove_idx:
+            positions = positions.drop(index=to_remove_idx).reset_index(drop=True)
+
+        candidates = df.copy()
+        candidates = candidates[
+            (candidates["apr_pct"].abs() >= entry_apr) &
+            (candidates["net_day_usd"] > MIN_NET_DAY_USD)
+        ]
+        candidates = candidates.sort_values("net_day_usd", ascending=False)
+
+        top_n_tg = max(0, int(top_n_tg))
+        if top_n_tg > 0 and not candidates.empty:
+            publish_rows = candidates.iloc[1:1+top_n_tg] if len(candidates) > 1 else pd.DataFrame(columns=candidates.columns)
+            for _, r in publish_rows.iterrows():
+                if r["price"] is None or r["price"] < MIN_PRICE:
+                    continue
+                qty = hedge_qty(eff_notional, r["price"])
+                nf = r.get("next_funding_utc") or "n/a"
+                card = (
+                    "🚀 <b>Funding OPEN</b>\n"
+                    f"<b>{r['exchange'].upper()} {r['symbol']}</b>\n"
+                    f"<code>APR: {r['apr_pct']}% | 8h: {round((r['rate_8h'] or 0)*100,6)}%</code>\n"
+                    f"Dir: <b>{'Short perp & Long spot' if r['direction']=='SHORT_PERP_LONG_SPOT' else 'Long perp & Short spot'}</b>\n"
+                    f"Price: {r['price']} | Qty(est): {qty}\n"
+                    f"Next funding: {nf}\n\n"
+                    f"<b>Profit/day (net): ${round2(r['net_day_usd'])}</b>\n"
+                    f"  • Funding/day (gross): ${round2(r['gross_day_usd'])}\n"
+                    f"  • Fees/day (amort): ${round2(r['fees_day_usd'])}\n"
+                    f"  • Borrow/day: ${round2(r['borrow_day_usd'])}\n"
+                )
+                maybe_send_telegram(card)
+
+        current_pos = positions.iloc[0] if len(positions) > 0 else None
+        best = candidates.head(1)
+        if not best.empty:
+            r = best.iloc[0]
+            ex, sym, dir_ = r["exchange"], r["symbol"], r["direction"]
+
+            need_open = current_pos is None
+            if current_pos is not None:
+                same = (str(current_pos["exchange"]).lower() == ex) and (str(current_pos["symbol"]).upper() == sym)
+                if same:
+                    need_open = False
+                else:
+                    current_net = 0.0 if pd.isna(current_pos.get("net_day_usd", None)) else float(current_pos.get("net_day_usd", 0.0))
+                    delta_usd = float(r["net_day_usd"] or 0.0) - current_net
+                    if rotate and delta_usd > float(rotate_delta_usd):
+                        close_msg = (f"🔁 <b>Funding ROTATE</b>\n"
+                                     f"Close: {str(current_pos['exchange']).upper()} {str(current_pos['symbol']).upper()}\n"
+                                     f"Open:  {ex.upper()} {sym}\n"
+                                     f"Delta net/day: ${round2(delta_usd)}")
+                        maybe_send_telegram(close_msg)
+                        positions = positions.iloc[0:0]
+                        need_open = True
+                    else:
+                        need_open = False
+
+            if need_open and (r["price"] is not None) and (r["price"] >= MIN_PRICE):
+                entry_qty = hedge_qty(eff_notional, r["price"])
+                payout8 = payout_8h_usd(r["rate_8h"], eff_notional)
+                payoutd = r["gross_day_usd"]
+                nf = r.get("next_funding_utc") or "n/a"
+
+                card = (
+                    "🚀 <b>Funding OPEN</b>\n"
+                    f"<b>{ex.upper()} {sym}</b>\n"
+                    f"<code>APR: {r['apr_pct']}% | 8h: {round((r['rate_8h'] or 0)*100,6)}%</code>\n"
+                    f"Dir: <b>{'Short perp & Long spot' if dir_=='SHORT_PERP_LONG_SPOT' else 'Long perp & Short spot'}</b>\n"
+                    f"Price: {r['price']} | Qty(est): {entry_qty}\n"
+                    f"Next funding: {nf}\n\n"
+                    f"<b>Profit/day (net): ${round2(r['net_day_usd'])}</b>\n"
+                    f"  • Funding/day (gross): ${round2(r['gross_day_usd'])}\n"
+                    f"  • Fees/day (amort): ${round2(r['fees_day_usd'])}\n"
+                    f"  • Borrow/day: ${round2(r['borrow_day_usd'])}\n"
+                )
+                maybe_send_telegram(card)
+
+                new_pos = {
+                    "exchange": ex, "symbol": sym, "direction": dir_,
+                    "entry_time_utc": r["time_utc"], "entry_ts": r["ts"],
+                    "entry_rate_8h": r["rate_8h"], "entry_apr_pct": r["apr_pct"],
+                    "entry_price": r["price"], "notional_usd": eff_notional,
+                    "net_day_usd": r["net_day_usd"]
+                }
+                positions = pd.DataFrame([new_pos], columns=list(new_pos.keys()))
+                batch_logs.append({
+                    "time_utc": now_utc, "action":"OPEN",
+                    "exchange": ex, "symbol": sym, "direction": dir_,
+                    "rate_8h": r["rate_8h"], "apr_pct": r["apr_pct"], "price": r["price"],
+                    "notional_usd": eff_notional, "payout_8h_usd": payout8, "payout_day_usd": payoutd,
+                    "reason": "best net/day"
+                })
+
+        write_csv(positions_csv_path, positions)
+        if batch_logs:
+            append_csv(log_csv_path, pd.DataFrame(batch_logs))
+
+        try:
+            printable = df[["exchange","symbol","price","rate_8h","rate_8h_pct","apr_pct","net_day_usd","time_utc","next_funding_utc","direction"]]
+            print(printable.to_string(index=False))
+        except Exception:
+            print(df.head().to_string(index=False))
     else:
         print("No data rows.")
+
+    # ---- ДОПОЛНИТЕЛЬНО: построить матрицу, если задан MATRIX_EXCHANGES ----
+    try:
+        run_matrix_from_env()
+    except Exception as e:
+        logging.warning("Matrix build failed: %s", e)
 
 if __name__ == "__main__":
     main()
