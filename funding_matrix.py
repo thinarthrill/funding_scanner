@@ -337,9 +337,9 @@ def resolve_bucket_env() -> Optional[str]:
     """
     Возьмём бакет из BACKET (твоя переменная) или из GCS_BUCKET (синоним).
     """
-    print("зашел!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
     b2 = os.getenv("GCS_BUCKET", "").strip()
-    print(b2)
+
     if b2:
         return b2
     return None
