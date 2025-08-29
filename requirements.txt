@@ -3,3 +3,4 @@ python-dotenv
 requests
 dotenv
 pandas
+google-cloud-storage
