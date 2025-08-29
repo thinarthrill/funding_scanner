@@ -1,3 +1,4 @@
-pandas
+web3
+python-dotenv
 requests
-google-cloud-storage
+dotenv
