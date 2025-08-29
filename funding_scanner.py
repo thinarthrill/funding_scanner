@@ -74,6 +74,11 @@ import json
 import hmac, hashlib, time
 from typing import Dict, Any, List, Optional, Set, Any as AnyT
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+load_dotenv()  # подгрузить .env
+for key, value in os.environ.items():
+    print(f"{key} = {value}")
 
 # Deps
 try:
