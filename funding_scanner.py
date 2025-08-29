@@ -77,8 +77,6 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()  # подгрузить .env
-for key, value in os.environ.items():
-    print(f"{key} = {value}")
 
 # Deps
 try:
@@ -895,7 +893,7 @@ top_n = int(getenv_float("TOP_N", 200))
 min_quote = float(getenv_float("MIN_QUOTE_USDT", 10_000_000))
 
 # Путь к матрице и режим выбора из неё
-matrix_path = getenv_str("MATRIX_READ_PATH", "")
+matrix_path = getenv_str("MATRIX_READ_PATH", "gs://thinarthrillbucket/funding_scanner/matrix_union.csv")
 matrix_mode = getenv_str("MATRIX_MODE", "union")  # union | intersection | atleast:k
 use_per_ex = getenv_bool("MATRIX_USE_PER_EXCHANGE", True)
 
