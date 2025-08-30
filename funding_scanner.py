@@ -616,20 +616,108 @@ def mexc_mark_price(sym_native: str) -> Optional[float]:
     except Exception:
         pass
     return None
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+MEXC_SESSION = None
+
+def build_short_session(timeout: float = 6.0, retries: int = 1, backoff: float = 0.0):
+    """
+    Отдельная сессия для MEXC с коротким таймаутом и без длинных backoff/Retry-After.
+    """
+    sess = requests.Session()
+    retry = Retry(
+        total=retries,
+        connect=retries,
+        read=retries,
+        backoff_factor=backoff,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        respect_retry_after_header=False,  # ВАЖНО: не ждать 60с по Retry-After
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    sess.headers.update({"User-Agent": "FundingScanner/fast-mexc"})
+    # кастомные поля, если используешь их где-то
+    sess.request_timeout = timeout
+    return sess
 
 def mexc_funding(symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Быстрый запрос funding по MEXC c короткими таймаутами и без минутных бэк-оффов.
+    Примерный формат ответа остаётся как в старом коде: {exchange, symbol, rate_8h, ts, next_funding_time, ...}
+    """
+    global MEXC_SESSION
+    if MEXC_SESSION is None:
+        MEXC_SESSION = build_short_session(timeout=6.0, retries=1, backoff=0.0)
+
+    base = "https://contract.mexc.com"
+    path = "/api/v1/contract/funding_rate/record"   # исторический/последний; если у тебя был другой — оставь свой
+    params = {"symbol": symbol, "page_size": 1}     # берём последнее значение
+
+    t0 = time.time()
     try:
-        sym_native = mexc_symbol(symbol)
-        r = SESSION.get("https://contract.mexc.com/api/v1/contract/funding/prevFundingRate",
-                        params={"symbol": sym_native}, timeout=REQUEST_TIMEOUT)
+        r = MEXC_SESSION.get(base + path, params=params, timeout=getattr(MEXC_SESSION, "request_timeout", 6.0))
+        dt = (time.time() - t0) * 1000
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("MEXC HTTP %s %s -> %s in %.0fms", path, symbol, r.status_code, dt)
+
+        # Быстрая обработка 429: маленькая пауза и один ре-трай вручную (без минутных спячек)
+        if r.status_code == 429:
+            time.sleep(1.5)
+            r = MEXC_SESSION.get(base + path, params=params, timeout=getattr(MEXC_SESSION, "request_timeout", 6.0))
+
         if r.status_code != 200:
             return None
+
         j = r.json()
-        data = j.get("data") or {}
-        rate = to_float(data.get("rate"))
-        price = mexc_mark_price(sym_native)
-        return {"exchange":"mexc","symbol":symbol.upper(),"price":price,"rate_8h":rate,"next_funding_time":None,"ts":utc_ms_now()}
-    except Exception:
+        # Под разные форматы данных: берём последнюю запись, где есть rate/time
+        data = None
+        if isinstance(j, dict):
+            data = j.get("data") or j.get("result") or j.get("records") or j.get("list")
+        elif isinstance(j, list):
+            data = j
+
+        if not data:
+            return None
+
+        # Берём первую/последнюю запись
+        rec = data[0] if isinstance(data, list) else data
+        # Часто поля называются по-разному, пробуем несколько ключей:
+        rate = rec.get("fundingRate") or rec.get("rate") or rec.get("funding_rate")
+        ts   = rec.get("time") or rec.get("timestamp") or rec.get("createdTime") or rec.get("created_at")
+
+        # Нормализуем типы
+        try:
+            rate = float(rate)
+        except Exception:
+            rate = None
+
+        # Переводим секунды → мс (если вдруг sec)
+        if ts is not None:
+            try:
+                ts = int(ts)
+                if ts < 10**12:  # похоже на секунды
+                    ts *= 1000
+            except Exception:
+                ts = None
+
+        row = {
+            "exchange": "mexc",
+            "symbol": symbol,
+            "rate_8h": rate,              # если MEXC отдаёт не 8h — адаптируй ниже
+            "ts": ts,
+            "next_funding_time": None,    # при желании сделай отдельный вызов "next"
+        }
+
+        return row
+
+    except Exception as e:
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("MEXC funding error %s: %s", symbol, e)
         return None
 
 # KuCoin Futures
