@@ -961,6 +961,10 @@ def scan_all(exchanges: List[str], symbols: List[str], symbols_by_ex: Optional[D
                 row = phemex_funding(sym)
             elif ex == "krakenf":
                 row = krakenf_funding(sym)
+            
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug("Scanned %s %s", ex, sym)
+
             if not row:
                 continue
             r8 = row.get("rate_8h")
@@ -1224,7 +1228,7 @@ def main():
 
     exchanges = [x.lower() for x in getenv_list("EXCHANGES", DEFAULT_EXCHANGES)]
     top_n = int(getenv_float("TOP_N", 200))
-    min_quote_usdt = float(getenv_float("MIN_QUOTE_USDT", 10_000_000))
+    min_quote_usdt = float(getenv_float("MIN_QUOTE_USDT", 1_000_000))
 
     # Paths (with BACKET auto-prefix for relative paths)
     raw_csv_path = bucketize_path(getenv_str("RAW_CSV_PATH", ""))
@@ -1268,6 +1272,11 @@ def main():
     logging.info("Effective per-leg notional = $%.2f (capital=%.2f, leverage=%.2f)", eff_notional, capital, perp_leverage)
 
     # Scan
+    if symbols_by_ex:
+        for ex in exchanges:
+            logging.info("Will scan %s: %d symbols", ex, len(symbols_by_ex.get(ex, [])))
+        else:
+            logging.info("Will scan all exchanges with the same symbol set: %d", len(symbols))
     df = scan_all(exchanges, symbols, symbols_by_ex=symbols_by_ex)
 
     if not df.empty:
