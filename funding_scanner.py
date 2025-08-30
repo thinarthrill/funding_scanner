@@ -1459,7 +1459,7 @@ def main():
 
         top_n_tg = max(0, int(top_n_tg))
         if top_n_tg > 0 and not candidates.empty:
-            publish_rows = candidates.iloc[top_n_tg] if len(candidates) > 1 else pd.DataFrame(columns=candidates.columns)
+            publish_rows = candidates.iloc[:top_n_tg] if len(candidates) > 1 else pd.DataFrame(columns=candidates.columns)
             for _, r in publish_rows.iterrows():
                 if r["price"] is None or r["price"] < MIN_PRICE:
                     continue
