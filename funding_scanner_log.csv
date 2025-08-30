@@ -1,0 +1,9 @@
+exchange,symbol,price,rate_8h,next_funding_time,ts,apr,suggestion,time,next_funding,rate_8h_pct,apr_pct
+binance,BTCUSDT,113461.3,5.17e-06,1755676800000.0,1755664830000,0.005661149999999999,Short perp & Long spot (shorts receive funding),2025-08-20 04:40:30 UTC,2025-08-20 08:00:00 UTC,0.0005,0.57
+binance,ETHUSDT,4159.1169031,1.398e-05,1755676800000.0,1755664830000,0.0153081,Short perp & Long spot (shorts receive funding),2025-08-20 04:40:30 UTC,2025-08-20 08:00:00 UTC,0.0014,1.53
+binance,SOLUSDT,180.57238596,4.716e-05,1755676800000.0,1755664830000,0.051640200000000004,Short perp & Long spot (shorts receive funding),2025-08-20 04:40:30 UTC,2025-08-20 08:00:00 UTC,0.0047,5.16
+binance,XRPUSDT,2.8903,-1.58e-05,1755676800000.0,1755664831000,-0.017301,Long perp & Short spot (longs receive funding),2025-08-20 04:40:31 UTC,2025-08-20 08:00:00 UTC,-0.0016,-1.73
+bybit,BTCUSDT,113479.0,0.0001,,1755664832348,0.10950000000000001,Short perp & Long spot (shorts receive funding),2025-08-20 04:40:32 UTC,,0.01,10.95
+bybit,ETHUSDT,4158.82,0.0001,,1755664832851,0.10950000000000001,Short perp & Long spot (shorts receive funding),2025-08-20 04:40:32 UTC,,0.01,10.95
+bybit,SOLUSDT,180.57,0.0001,,1755664833360,0.10950000000000001,Short perp & Long spot (shorts receive funding),2025-08-20 04:40:33 UTC,,0.01,10.95
+bybit,XRPUSDT,2.8891,6.663e-05,,1755664833867,0.07295985,Short perp & Long spot (shorts receive funding),2025-08-20 04:40:33 UTC,,0.0067,7.3
