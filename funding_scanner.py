@@ -302,21 +302,68 @@ def maybe_send_telegram(text: str) -> None:
         logging.warning("Telegram exception: %s", e)
 
 def load_positions_df(path: str) -> pd.DataFrame:
+    # полный набор полей, с которыми работает симулятор
+    expected_cols = [
+        "id","symbol","long_ex","short_ex",
+        "opened_ms","last_ms","held_h",
+        "size_usd","open_apr_combo",
+        "status","accrued_usd",
+        "open_note","closed_ms","pnl_usd","close_note"
+    ]
+
     path = bucketize_path(path)
-    if not path:
-        return pd.DataFrame()
-    if is_gs(path):
-        return gcs_read_csv(path)
-    if os.path.exists(path):
-        return pd.read_csv(path)
-    return pd.DataFrame()
+
+    def _empty_df():
+        return pd.DataFrame(columns=expected_cols)
+
+    if not path or str(path).strip() == "":
+        return _empty_df()
+
+    try:
+        if is_gs(path):
+            # у тебя gcs_read_csv требует expected_columns — передаём!
+            df = gcs_read_csv(path, expected_columns=expected_cols)
+        else:
+            if not os.path.exists(path):
+                return _empty_df()
+            df = pd.read_csv(path)
+    except Exception as e:
+        logging.warning("Positions load error %s: %s", path, e)
+        return _empty_df()
+
+    if df is None or df.empty:
+        return _empty_df()
+
+    # добавим недостающие колонки, сохраним порядок
+    for c in expected_cols:
+        if c not in df.columns:
+            df[c] = None
+    # оставим только нужные (и в правильном порядке)
+    df = df[expected_cols].copy()
+
+    # базовая нормализация типов (без фанатизма)
+    for col in ["id","opened_ms","last_ms","closed_ms"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+    for col in ["size_usd","open_apr_combo","accrued_usd","pnl_usd","held_h"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    for col in ["symbol","long_ex","short_ex","status","open_note","close_note"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+
+    return df
 
 def save_positions_df(path: str, df: pd.DataFrame) -> None:
     path = bucketize_path(path)
     if is_gs(path):
         gcs_write_csv(path, df)
     else:
+        # гарантируем, что папка существует
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         df.to_csv(path, index=False)
+
 
 def read_csv(path: Optional[str], columns: List[str]) -> pd.DataFrame:
     if not path or path.strip() == "":
