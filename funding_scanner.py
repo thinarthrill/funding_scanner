@@ -301,6 +301,23 @@ def maybe_send_telegram(text: str) -> None:
     except Exception as e:
         logging.warning("Telegram exception: %s", e)
 
+def load_positions_df(path: str) -> pd.DataFrame:
+    path = bucketize_path(path)
+    if not path:
+        return pd.DataFrame()
+    if is_gs(path):
+        return gcs_read_csv(path)
+    if os.path.exists(path):
+        return pd.read_csv(path)
+    return pd.DataFrame()
+
+def save_positions_df(path: str, df: pd.DataFrame) -> None:
+    path = bucketize_path(path)
+    if is_gs(path):
+        gcs_write_csv(path, df)
+    else:
+        df.to_csv(path, index=False)
+
 def read_csv(path: Optional[str], columns: List[str]) -> pd.DataFrame:
     if not path or path.strip() == "":
         return pd.DataFrame(columns=columns)
@@ -1305,6 +1322,232 @@ def run_matrix_from_env() -> Optional[pd.DataFrame]:
             except Exception as e:
                 logging.warning("Failed to save matrix to file: %s", e)
     return df
+# ===== Funding → кросс-биржевые кандидаты =====
+# ===== Пэйпер-симуляция позиций (perp vs perp cross-ex) =====
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _hours_between(ts_ms_a: int, ts_ms_b: int) -> float:
+    return abs(ts_ms_a - ts_ms_b) / 3_600_000.0
+
+def positions_open_close_loop(
+    df_raw: pd.DataFrame,
+    best_row: Optional[pd.Series],
+    per_leg_notional_usd: float,
+    entry_apr_threshold: float,
+    exit_apr_threshold: float,
+    max_holding_h: float,
+    default_fee: float,
+    pos_path: str,
+    paper: bool = True,
+) -> list[str]:
+    """
+    Обновляет позы (открывает/закрывает) и возвращает список Telegram-сообщений.
+    Логика:
+      - если best_row есть и apr_combo >= ENTRY_APR — открыть, если нет активной по этой паре.
+      - для открытых поз — накапливаем PnL по времени (приближение), закрываем при apr_combo < EXIT_APR или по сроку.
+    """
+    messages: list[str] = []
+    now_ms = _now_ms()
+
+    # загрузить текущие позы
+    df_pos = load_positions_df(pos_path)
+    if df_pos.empty:
+        df_pos = pd.DataFrame(columns=[
+            "id","symbol","long_ex","short_ex","opened_ms","last_ms",
+            "size_usd","open_apr_combo","status","accrued_usd","open_note"
+        ])
+
+    # построим быструю карту текущих APR (чтобы апдейтить PnL)
+    apr_map = {}  # (ex,sym)->apr
+    for _, r in df_raw[["exchange","symbol","apr"]].dropna().iterrows():
+        apr_map[(str(r["exchange"]).lower(), str(r["symbol"]).upper())] = float(r["apr"])
+
+    # 1) апдейт открытых
+    for i in range(len(df_pos)):
+        if str(df_pos.at[i,"status"]) != "open":
+            continue
+        long_ex  = str(df_pos.at[i,"long_ex"])
+        short_ex = str(df_pos.at[i,"short_ex"])
+        sym      = str(df_pos.at[i,"symbol"]).upper()
+        last_ms  = int(df_pos.at[i,"last_ms"] or df_pos.at[i,"opened_ms"])
+        held_h   = float(df_pos.at[i].get("held_h", 0.0))
+
+        # текущие APR
+        apr_long  = apr_map.get((long_ex, sym), 0.0)
+        apr_short = apr_map.get((short_ex, sym), 0.0)
+        apr_combo = abs(min(0.0, apr_long)) + max(0.0, apr_short)  # сколько «получаем» сейчас
+
+        dt_h = _hours_between(now_ms, last_ms)
+        df_pos.at[i,"held_h"] = held_h + dt_h
+
+        # начислить за dt_h
+        combo_frac = (dt_h / (24.0 * 365.0))
+        delta_usd = per_leg_notional_usd * (apr_combo * combo_frac)
+        df_pos.at[i,"accrued_usd"] = float(df_pos.at[i].get("accrued_usd", 0.0)) + delta_usd
+        df_pos.at[i,"last_ms"] = now_ms
+
+        # критерии выхода
+        do_close = False
+        reason = ""
+        if apr_combo*100.0 < float(exit_apr_threshold):
+            do_close = True
+            reason = f"APR fell below EXIT ({apr_combo*100:.2f}% < {exit_apr_threshold:.2f}%)"
+        if df_pos.at[i,"held_h"] >= float(max_holding_h):
+            do_close = True
+            reason = f"MAX_HOLDING_H reached ({df_pos.at[i]['held_h']:.1f}h)"
+
+        if do_close:
+            # комиссии на выход
+            fee_long  = _taker_fee_for(long_ex, default_fee)
+            fee_short = _taker_fee_for(short_ex, default_fee)
+            exit_fees = per_leg_notional_usd * (fee_long + fee_short) * 2  # 2 ордера (закрытие 2 ног)
+            pnl = float(df_pos.at[i,"accrued_usd"]) - exit_fees
+            df_pos.at[i,"status"] = "closed"
+            df_pos.at[i,"closed_ms"] = now_ms
+            df_pos.at[i,"pnl_usd"] = round(pnl, 4)
+            df_pos.at[i,"close_note"] = reason
+
+            msg = (
+                f"✅ <b>Closed</b> {sym}\n"
+                f"LONG {long_ex.upper()} / SHORT {short_ex.upper()}\n"
+                f"Held: {df_pos.at[i,'held_h']:.1f}h | APR_now: {apr_combo*100:.2f}%\n"
+                f"Accrued: ${float(df_pos.at[i,'accrued_usd']):.2f}\n"
+                f"Exit fees: ${exit_fees:.2f}\n"
+                f"<b>PNL:</b> ${pnl:.2f}\n"
+                f"Reason: {reason}"
+            )
+            messages.append(msg)
+
+    # 2) открыть новую, если есть сильный кандидат и нет открытой на ту же пару
+    if best_row is not None and not df_raw.empty:
+        apr_combo_pct = float(best_row["apr_combo"]) * 100.0
+        if apr_combo_pct >= float(entry_apr_threshold):
+            long_ex  = str(best_row["long_ex"])
+            short_ex = str(best_row["short_ex"])
+            sym      = str(best_row["symbol"]).upper()
+            # нет ли уже такой открытой?
+            exists = False
+            for _, p in df_pos.iterrows():
+                if p.get("status") == "open" and p.get("symbol")==sym and p.get("long_ex")==long_ex and p.get("short_ex")==short_ex:
+                    exists = True
+                    break
+            if not exists:
+                # комиссии на вход
+                fee_long  = _taker_fee_for(long_ex, default_fee)
+                fee_short = _taker_fee_for(short_ex, default_fee)
+                entry_fees = per_leg_notional_usd * (fee_long + fee_short) * 2  # 2 ордера (вход 2 ног)
+
+                new = {
+                    "id": int(df_pos["id"].max()+1) if "id" in df_pos.columns and not df_pos["id"].empty else 1,
+                    "symbol": sym,
+                    "long_ex": long_ex,
+                    "short_ex": short_ex,
+                    "opened_ms": now_ms,
+                    "last_ms": now_ms,
+                    "size_usd": per_leg_notional_usd,
+                    "open_apr_combo": float(best_row["apr_combo"]),    # доля, не %
+                    "status": "open",
+                    "accrued_usd": -entry_fees,
+                    "open_note": f"entry fees ${entry_fees:.2f}",
+                    "held_h": 0.0,
+                }
+                df_pos = pd.concat([df_pos, pd.DataFrame([new])], ignore_index=True)
+
+                msg = (
+                    f"🚀 <b>Opened</b> {sym}\n"
+                    f"LONG {long_ex.upper()} / SHORT {short_ex.upper()}\n"
+                    f"Combo APR: {apr_combo_pct:.2f}% | Size: ${per_leg_notional_usd:,.2f} per leg\n"
+                    f"Expected (next {int(best_row['exp_hours'])}h): "
+                    f"<b>${float(best_row['net_usd']):.2f}</b> after fees"
+                )
+                messages.append(msg)
+
+    # сохранить позы
+    save_positions_df(pos_path, df_pos)
+    return messages
+
+def _taker_fee_for(ex: str, default_fee: float) -> float:
+    # при желании заполни реальными комиссиями по биржам
+    per_ex = {
+        "bybit": 0.00055,
+        # "binance": 0.0004,
+        # "okx": 0.0005,
+        # ...
+    }
+    return float(per_ex.get(ex, default_fee))
+
+def build_cross_exchange_candidates(
+    df_raw: pd.DataFrame,
+    expected_h: float,
+    per_leg_notional_usd: float,
+    default_fee: float,
+) -> pd.DataFrame:
+    """
+    Находит пары бирж для одного и того же символа, где
+    на одной funding APR > 0 (SHORT получает), а на другой APR < 0 (LONG получает).
+    Возвращает DataFrame, отсортированный по ожидаемой прибыли (USD) за expected_h.
+    """
+    if df_raw.empty:
+        return pd.DataFrame()
+
+    # нормализуем
+    use = df_raw[["exchange","symbol","apr","rate_8h","next_funding_utc","time_utc"]].copy()
+    use["exchange"] = use["exchange"].str.lower()
+    use["symbol"] = use["symbol"].str.upper()
+    use = use.dropna(subset=["apr"])
+
+    # по символам — строим список строк
+    symbols = use["symbol"].unique().tolist()
+    rows = []
+    hours_frac = max(0.0, float(expected_h)) / (24.0 * 365.0)  # доля года
+
+    for sym in symbols:
+        sub = use[use["symbol"] == sym]
+        if len(sub) < 2:
+            continue
+        # положительные (SHORT получает), отрицательные (LONG получает)
+        pos = sub[sub["apr"] > 0.0]
+        neg = sub[sub["apr"] < 0.0]
+        if pos.empty or neg.empty:
+            continue
+
+        for _, r_pos in pos.iterrows():
+            for _, r_neg in neg.iterrows():
+                ex_short = r_pos["exchange"]  # там шортим перп (получаем +APR)
+                ex_long  = r_neg["exchange"]  # там лонг перп (получаем |APR|)
+                apr_short = float(r_pos["apr"])
+                apr_long_abs = abs(float(r_neg["apr"]))
+                apr_combo = apr_short + apr_long_abs  # комбинированный APR «получаем»
+
+                # комиссии (в USD) — 2 ордера на вход + 2 на выход
+                fee_short = _taker_fee_for(ex_short, default_fee)
+                fee_long  = _taker_fee_for(ex_long,  default_fee)
+                fees_usd  = per_leg_notional_usd * (2*fee_short + 2*fee_long)
+
+                # ожидаемый доход по фандингу за expected_h
+                funding_usd = per_leg_notional_usd * apr_combo * hours_frac
+
+                net_usd = funding_usd - fees_usd
+
+                rows.append({
+                    "symbol": sym,
+                    "long_ex": ex_long,
+                    "short_ex": ex_short,
+                    "apr_long_abs": apr_long_abs,
+                    "apr_short": apr_short,
+                    "apr_combo": apr_combo,        # %
+                    "exp_hours": expected_h,
+                    "funding_usd": round(funding_usd, 4),
+                    "fees_usd": round(fees_usd, 4),
+                    "net_usd": round(net_usd, 4),
+                })
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["net_usd","apr_combo"], ascending=[False, False]).reset_index(drop=True)
+    return out
 
 # ------------------------------
 # Main
@@ -1366,6 +1609,59 @@ def main():
         else:
             logging.info("Will scan all exchanges with the same symbol set: %d", len(symbols))
     df = scan_all(exchanges, symbols, symbols_by_ex=symbols_by_ex)
+
+    # ===== после df_raw = scan_all(...) =====
+
+    # 1) параметры
+    paper = getenv_bool("PAPER_TRADING", True)
+    expected_h = float(getenv_float("EXPECTED_HOLDING_H", 72))
+    entry_apr = float(getenv_float("ENTRY_APR", 25))       # %
+    exit_apr  = float(getenv_float("EXIT_APR", 12))        # %
+    max_hold  = float(getenv_float("MAX_HOLDING_H", 72))   # h
+    default_fee = float(getenv_float("TAKER_FEE", 0.0005))
+
+    # размер позиции: если у тебя уже вычисляется «Effective per-leg notional», используй его.
+    # иначе — безопасный дефолт:
+    capital = float(getenv_float("CAPITAL", 1000))
+    lev     = float(getenv_float("PERP_LEVERAGE", 5))
+    per_leg_notional = max(10.0, round((capital * lev) / 2.0, 2))  # на каждую ногу
+
+    # 2) построить кандидатов cross-ex
+    cands = build_cross_exchange_candidates(
+        df_raw=df,
+        expected_h=expected_h,
+        per_leg_notional_usd=per_leg_notional,
+        default_fee=default_fee,
+    )
+
+    best = cands.iloc[0] if not cands.empty else None
+
+    # 3) выслать лучший сигнал в Telegram
+    if best is not None:
+        msg = (
+            f"📈 <b>Best cross-ex funding</b>\n"
+            f"{best['symbol']}: LONG {str(best['long_ex']).upper()} / SHORT {str(best['short_ex']).upper()}\n"
+            f"Combo APR: {float(best['apr_combo'])*100:.2f}%\n"
+            f"Expected {int(expected_h)}h: <b>${float(best['net_usd']):.2f}</b> "
+            f"(funding ${float(best['funding_usd']):.2f} − fees ${float(best['fees_usd']):.2f})"
+        )
+        maybe_send_telegram(msg)
+
+    # 4) симуляция открытия/закрытия + Telegram апдейты
+    pos_path = getenv_str("POSITIONS_CSV_PATH", "positions.csv")
+    events = positions_open_close_loop(
+        df_raw=df,
+        best_row=best,
+        per_leg_notional_usd=per_leg_notional,
+        entry_apr_threshold=entry_apr,
+        exit_apr_threshold=exit_apr,
+        max_holding_h=max_hold,
+        default_fee=default_fee,
+        pos_path=pos_path,
+        paper=paper,
+    )
+    for e in events:
+        maybe_send_telegram(e)
 
     if not df.empty:
         # Costs/PNL metrics
