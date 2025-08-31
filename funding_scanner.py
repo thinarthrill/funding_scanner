@@ -9,62 +9,16 @@ Funding Signaler + Availability Matrix (All-in-One)
 - Сохранение CSV локально или в GCS
 - ENV BACKET: если задано имя bucket, относительные пути автоматически преобразуются в gs://<BACKET>/<filename>
 
-Примеры ENV:
-  EXCHANGES=binance,bybit,okx,mexc,kucoin,bitget,gate,phemex,krakenf,deribit
-  SYMBOLS_SOURCE=binance-top              # common | binance-top | union | manual
-  SYMBOLS=BTCUSDT,ETHUSDT                 # если SYMBOLS_SOURCE=manual
-  TOP_N=150
-  MIN_QUOTE_USDT=15000000
+ВАЖНО (что изменено):
+- Один флаг режима торговли: PAPER (true/false) — PAPER_TRADING удалён.
+- Разнесены файлы позиций: POS_CROSS_PATH (кросс-биржевые ножки) и POS_SIGNALS_PATH (однобиржевые сигналы).
+- Binance funding/mark: используем /fapi/v1/premiumIndex.
+- MEXC funding: /api/v1/contract/funding_rate/{BASE_QUOTE}, символ вида BTC_USDT.
+- После реальных ордеров на тестнетах выполняется verify_testnet_positions(symbol).
+- Публикуются карточки даже при одном кандидате.
 
-  # Пороговые параметры
-  ENTRY_APR=15
-  EXIT_APR=8
-  MAX_HOLDING_H=48
-  NOTIONAL=                                 # если пусто — считается от CAPITAL и PERP_LEVERAGE
-  CAPITAL=1000
-  PERP_LEVERAGE=5
-  TAKER_FEE=0.0005
-  BORROW_APR=0.10
-  EXPECTED_HOLDING_H=24
-  MIN_NET_DAY_USD=0
-  MIN_PRICE=0
-
-  # Ротация
-  TOP_N_TELEGRAM=3
-  ROTATE=false
-  ROTATE_DELTA_USD=0
-
-  # Пути вывода (могут быть относительные или gs://...)
-  RAW_CSV_PATH=raw.csv
-  LOG_CSV_PATH=signals_log.csv
-  POSITIONS_CSV_PATH=positions.csv
-
-  # GCS & bucket
-  BACKET=my-bucket-name                     # если задать: raw.csv => gs://my-bucket-name/raw.csv
-  GCS_KEY_JSON=...                          # service account JSON (строкой) ИЛИ GOOGLE_APPLICATION_CREDENTIALS
-
-  # Matrix (по желанию)
-  MATRIX_EXCHANGES=binance,bybit,okx,mexc,kucoin,bitget,gate,phemex,krakenf,deribit
-  MATRIX_UNIVERSE=union                     # common | binance-top | union | manual
-  MATRIX_SYMBOLS=BTCUSDT,ETHUSDT            # когда MATRIX_UNIVERSE=manual
-  MATRIX_TOP_N=200
-  MATRIX_MIN_QUOTE=10000000
-  MATRIX_SLEEP_MS=300
-  MATRIX_SAVE_PATH=matrix.csv
-
-  # Телеграм (опционально)
-  TELEGRAM_BOT_TOKEN=
-  TELEGRAM_CHAT_ID=
-
-  # Прочее
-  USER_AGENT=FundingSignaler/1.4
-  REQUEST_TIMEOUT=15
-  DEBUG=false
+Примеры ENV (см. ниже отдельный блок .env).
 """
-# Новые ENV для работы с матрицей:
-# MATRIX_READ_PATH=gs://thinarthrillbucket/funding_scanner/matrix_union.csv
-# MATRIX_MODE=union           # union | intersection | atleast:2
-# MATRIX_USE_PER_EXCHANGE=true  # если true — сканер берёт набор тикеров отдельно для каждой биржи из матрицы
 
 import os
 import sys
@@ -77,14 +31,6 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()  # подгрузить .env
-
-# Deps
-try:
-    import requests
-    import pandas as pd
-except Exception:
-    print("Install dependencies: pip install requests pandas", file=sys.stderr)
-    raise
 
 # ------------------------------
 # ENV helpers
@@ -113,8 +59,6 @@ def getenv_list(key: str, default_list: List[str]) -> List[str]:
         return default_list
     return [x.strip() for x in v.split(",") if x.strip()]
 
-
-
 # ------------------------------
 # Requests session + logging
 # ------------------------------
@@ -127,6 +71,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+import requests
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
 
@@ -179,7 +124,7 @@ def gcs_client():
         return storage.Client.from_service_account_json(key_path)
     return storage.Client()
 
-def gcs_read_csv(gs_path: str, expected_columns: List[str]) -> pd.DataFrame:
+def gcs_read_csv(gs_path: str, expected_columns: List[str]):
     try:
         client = gcs_client()
         bucket_name, blob_name = gcs_split(gs_path)
@@ -188,8 +133,10 @@ def gcs_read_csv(gs_path: str, expected_columns: List[str]) -> pd.DataFrame:
             raise FileNotFoundError(f"Bucket '{bucket_name}' not found or access denied")
         blob = bucket.blob(blob_name)
         if not blob.exists():
+            import pandas as pd
             return pd.DataFrame(columns=expected_columns)
         data = blob.download_as_bytes()
+        import pandas as pd
         df = pd.read_csv(pd.io.common.BytesIO(data))
         for c in expected_columns:
             if c not in df.columns:
@@ -197,9 +144,10 @@ def gcs_read_csv(gs_path: str, expected_columns: List[str]) -> pd.DataFrame:
         return df[expected_columns]
     except Exception as e:
         logging.warning("GCS read error %s: %s", gs_path, e)
+        import pandas as pd
         return pd.DataFrame(columns=expected_columns)
 
-def gcs_write_csv(gs_path: str, df: pd.DataFrame) -> None:
+def gcs_write_csv(gs_path: str, df):
     try:
         client = gcs_client()
         bucket_name, blob_name = gcs_split(gs_path)
@@ -229,7 +177,6 @@ def bucketize_path(path: Optional[str]) -> Optional[str]:
         return p
     backet = getenv_str("BACKET", "")
     if backet:
-        # sanitize slashes
         p = p.lstrip("/").replace("\\", "/")
         return f"gs://{backet}/{p}"
     return p
@@ -298,6 +245,9 @@ def daily_borrow_cost_usd(notional: float, borrow_apr: float) -> float:
 def round2(x):
     return None if x is None else (round(float(x), 2))
 
+# ------------------------------
+# Verify positions logger
+# ------------------------------
 def verify_testnet_positions(symbol: str):
     try:
         b_positions = binance_futures_positions(symbol) or []
@@ -307,6 +257,9 @@ def verify_testnet_positions(symbol: str):
     except Exception as e:
         logging.warning("Verify positions error: %s", e)
 
+# ------------------------------
+# Telegram
+# ------------------------------
 def maybe_send_telegram(text: str) -> None:
     token = getenv_str("TELEGRAM_BOT_TOKEN", "")
     chat_id = getenv_str("TELEGRAM_CHAT_ID", "")
@@ -321,8 +274,11 @@ def maybe_send_telegram(text: str) -> None:
     except Exception as e:
         logging.warning("Telegram exception: %s", e)
 
-def load_positions_df(path: str) -> pd.DataFrame:
-    # полный набор полей, с которыми работает симулятор
+# ------------------------------
+# Positions CSV helpers
+# ------------------------------
+def load_positions_df(path: str):
+    import pandas as pd
     expected_cols = [
         "id","symbol","long_ex","short_ex",
         "opened_ms","last_ms","held_h",
@@ -330,62 +286,51 @@ def load_positions_df(path: str) -> pd.DataFrame:
         "status","accrued_usd",
         "open_note","closed_ms","pnl_usd","close_note"
     ]
-
     path = bucketize_path(path)
-
-    def _empty_df():
+    def _empty():
         return pd.DataFrame(columns=expected_cols)
-
     if not path or str(path).strip() == "":
-        return _empty_df()
-
+        return _empty()
     try:
         if is_gs(path):
-            # у тебя gcs_read_csv требует expected_columns — передаём!
             df = gcs_read_csv(path, expected_columns=expected_cols)
         else:
             if not os.path.exists(path):
-                return _empty_df()
+                return _empty()
+            import pandas as pd
             df = pd.read_csv(path)
     except Exception as e:
         logging.warning("Positions load error %s: %s", path, e)
-        return _empty_df()
-
+        return _empty()
     if df is None or df.empty:
-        return _empty_df()
-
-    # добавим недостающие колонки, сохраним порядок
+        return _empty()
     for c in expected_cols:
         if c not in df.columns:
             df[c] = None
-    # оставим только нужные (и в правильном порядке)
     df = df[expected_cols].copy()
-
-    # базовая нормализация типов (без фанатизма)
     for col in ["id","opened_ms","last_ms","closed_ms"]:
         if col in df.columns:
+            import pandas as pd
             df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
     for col in ["size_usd","open_apr_combo","accrued_usd","pnl_usd","held_h"]:
         if col in df.columns:
+            import pandas as pd
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
     for col in ["symbol","long_ex","short_ex","status","open_note","close_note"]:
         if col in df.columns:
             df[col] = df[col].astype(str)
-
     return df
 
-def save_positions_df(path: str, df: pd.DataFrame) -> None:
+def save_positions_df(path: str, df) -> None:
     path = bucketize_path(path)
     if is_gs(path):
         gcs_write_csv(path, df)
     else:
-        # гарантируем, что папка существует
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         df.to_csv(path, index=False)
 
-
-def read_csv(path: Optional[str], columns: List[str]) -> pd.DataFrame:
+def read_csv(path: Optional[str], columns: List[str]):
+    import pandas as pd
     if not path or path.strip() == "":
         return pd.DataFrame(columns=columns)
     p = bucketize_path(path)
@@ -402,33 +347,32 @@ def read_csv(path: Optional[str], columns: List[str]) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame(columns=columns)
 
-def write_csv(path: Optional[str], df: pd.DataFrame) -> None:
+def write_csv(path: Optional[str], df) -> None:
     if not path or path.strip() == "": return
     p = bucketize_path(path)
     if is_gs(p):
-        gcs_write_csv(p, df)
-        return
+        gcs_write_csv(p, df); return
     tmp = f"{p}.tmp"
     df.to_csv(tmp, index=False)
     os.replace(tmp, p)
 
-def append_csv(path: Optional[str], df: pd.DataFrame) -> None:
+def append_csv(path: Optional[str], df) -> None:
     if df is None or df.empty or not path or path.strip() == "": return
     p = bucketize_path(path)
     if is_gs(p):
-        # emulate append: read+concat+write
         cols = list(df.columns)
         existing = gcs_read_csv(p, cols)
-        out = pd.concat([existing, df], ignore_index=True)
+        from pandas import concat
+        out = concat([existing, df], ignore_index=True)
         gcs_write_csv(p, out)
         return
     header = not os.path.exists(p)
     df.to_csv(p, mode="a", header=header, index=False)
 
 # ===== Matrix I/O helpers =====
+import pandas as pd
 
 def _gcs_read_any(gs_path: str) -> pd.DataFrame:
-    """Прямое чтение CSV из GCS без списка ожидаемых колонок."""
     try:
         client = gcs_client()
         bucket_name, blob_name = gcs_split(gs_path)
@@ -445,10 +389,6 @@ def _gcs_read_any(gs_path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def load_matrix_df(matrix_path: str) -> pd.DataFrame:
-    """
-    Считывает матрицу доступности из локального пути или gs://...
-    Приводит TRUE/FALSE к bool.
-    """
     p = bucketize_path(matrix_path)
     if not p:
         return pd.DataFrame()
@@ -460,17 +400,12 @@ def load_matrix_df(matrix_path: str) -> pd.DataFrame:
     except Exception as e:
         logging.warning("Matrix read error %s: %s", p, e)
         return pd.DataFrame()
-
     if df.empty:
         return df
-
-    # нормализуем колонки и типы
     df.columns = [c.strip() for c in df.columns]
     if "symbol" not in df.columns:
         logging.warning("Matrix has no 'symbol' column: %s", df.columns.tolist())
         return pd.DataFrame()
-
-    # приведение True/False (иногда приезжает как 'True'/'False'/'1'/'0')
     for c in df.columns:
         if c in ("symbol", "listed_on"):
             continue
@@ -488,29 +423,15 @@ def load_matrix_df(matrix_path: str) -> pd.DataFrame:
             pass
     return df
 
-def symbols_from_matrix(
-    matrix_path: str,
-    exchanges: List[str],
-    mode: str = "union"  # "union" | "intersection" | "atleast:k"
-) -> List[str]:
-    """
-    Возвращает список символов из матрицы по заданным биржам.
-    - union: есть хотя бы на одной из бирж
-    - intersection: есть на всех биржах
-    - atleast:k  (например, atleast:2)
-    """
+def symbols_from_matrix(matrix_path: str, exchanges: List[str], mode: str = "union") -> List[str]:
     df = load_matrix_df(matrix_path)
     if df.empty:
         return []
-
     ex_cols = [ex for ex in exchanges if ex in df.columns]
     if not ex_cols:
-        # если в матрице нет колонок с такими биржами — отдаём пусто
         logging.warning("Matrix has no columns for exchanges: %s (have: %s)", exchanges, df.columns.tolist())
         return []
-
     sub = df[["symbol"] + ex_cols].copy()
-
     if mode.startswith("atleast:"):
         try:
             k = int(mode.split(":",1)[1])
@@ -521,29 +442,18 @@ def symbols_from_matrix(
         mask = sub[ex_cols].all(axis=1)
     else:
         mask = sub[ex_cols].any(axis=1)
-
     out = sorted(sub.loc[mask, "symbol"].dropna().astype(str).str.upper().unique().tolist())
     return out
 
-def matrix_by_exchange(
-    matrix_path: str,
-    exchanges: List[str]
-) -> Dict[str, List[str]]:
-    """
-    Возвращает словарь {exchange: [symbols...]} — только те пары,
-    где в матрице для этой биржи стоит True.
-    Удобно для точечного сканирования без «лишних» запросов к API.
-    """
+def matrix_by_exchange(matrix_path: str, exchanges: List[str]) -> Dict[str, List[str]]:
     df = load_matrix_df(matrix_path)
     if df.empty:
         return {ex: [] for ex in exchanges}
-
     ex_cols = [ex for ex in exchanges if ex in df.columns]
     out: Dict[str, List[str]] = {}
     for ex in exchanges:
         if ex not in ex_cols:
-            out[ex] = []
-            continue
+            out[ex] = []; continue
         syms = df.loc[df[ex].astype(bool), "symbol"].dropna().astype(str).str.upper().unique().tolist()
         out[ex] = sorted(syms)
     return out
@@ -551,40 +461,56 @@ def matrix_by_exchange(
 # ------------------------------
 # Exchange clients (funding)
 # ------------------------------
-def bybit_get_fee(symbol: str) -> Optional[float]:
-    try:
-        api_key = os.getenv("BYBIT_API_KEY", "")
-        api_secret = os.getenv("BYBIT_API_SECRET", "")
-        if not api_key or not api_secret:
+def bybit_get_fee(symbol: str, default_fee: float = 0.0006) -> dict:
+    import logging
+    def _parse_fee_payload(j: dict) -> tuple | None:
+        node = (j.get("result") or j.get("data")) or {}
+        items = node.get("list") or node.get("rows") or []
+        if not isinstance(items, list) or not items:
             return None
-        url = f"{bybit_base()}/v5/market/instruments-info"
-        params = {"category":"linear","symbol":symbol.upper()}
-        ts = str(int(time.time()*1000))
-        param_str = "&".join([f"{k}={v}" for k,v in sorted(params.items())])
-        sign_str = ts + api_key + "5000" + param_str
-        signature = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-        headers = {
-            "X-BAPI-API-KEY": api_key,
-            "X-BAPI-SIGN": signature,
-            "X-BAPI-SIGN-TYPE": "2",
-            "X-BAPI-TIMESTAMP": ts,
-            "X-BAPI-RECV-WINDOW": "5000",
-        }
-        r = SESSION.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
-        j = r.json()
-        if j.get("retCode") == 0:
-            fee_str = j["result"]["list"][0]["takerFeeRate"]
-            return float(fee_str)
-    except Exception as e:
-        logging.warning("Bybit fee API exception: %s", e)
-    return None
+        rec = items[0] if isinstance(items[0], dict) else {}
+        maker = rec.get("makerFeeRate") or rec.get("makerFee") or rec.get("maker_fee_rate")
+        taker = rec.get("takerFeeRate") or rec.get("takerFee") or rec.get("taker_fee_rate")
+        try:
+            return float(maker), float(taker)
+        except Exception:
+            return None
+    def _req(params: dict) -> dict | None:
+        try:
+            signed = bybit_signed(params)
+        except Exception as e:
+            logging.warning("Bybit fee sign error: %s", e); return None
+        try:
+            r = SESSION.get(f"{bybit_base()}/v5/account/fee-rate",
+                            headers=signed["headers"], params=params,
+                            timeout=REQUEST_TIMEOUT)
+            if r.status_code != 200:
+                logging.warning("Bybit fee HTTP %s: %s", r.status_code, r.text[:200])
+                return None
+            return r.json()
+        except Exception as e:
+            logging.warning("Bybit fee HTTP exception: %s", e)
+            return None
+    symbol_up = (symbol or "").upper()
+    j = _req({"category": "linear", "symbol": symbol_up})
+    fees = _parse_fee_payload(j or {}) if j else None
+    if not fees:
+        j2 = _req({"category":"linear"})
+        fees = _parse_fee_payload(j2 or {}) if j2 else None
+    if not fees:
+        logging.warning("Bybit fee fallback for %s: using default maker=taker=%.6f", symbol_up, default_fee)
+        return {"maker": float(default_fee), "taker": float(default_fee)}
+    maker, taker = fees
+    return {"maker": float(maker), "taker": float(taker)}
 
-# Binance
+# Binance funding/mark
 def binance_premium_index(symbol: str) -> Optional[Dict[str, Any]]:
-    url = f"{binance_fapi_base()}/fapi/v1/exchangeInfo"
     try:
-        r = SESSION.get(url, params={"symbol": symbol.upper()}, timeout=REQUEST_TIMEOUT)
+        r = SESSION.get(f"{binance_fapi_base()}/fapi/v1/premiumIndex",
+                        params={"symbol": symbol.upper()},
+                        timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
+            logging.debug("BINANCE premiumIndex %s -> %s %s", symbol, r.status_code, r.text[:160])
             return None
         j = r.json()
         return {
@@ -610,15 +536,6 @@ def fetch_bybit_mark_price(symbol: str) -> Optional[float]:
             if rows:
                 px = (to_float(rows[0].get("lastPrice")) or to_float(rows[0].get("markPrice")))
                 if px: return px
-        # fallback
-        r2 = SESSION.get(f"{bybit_base()}/v5/market/instruments-info",
-                         params={"category":"linear","symbol":symbol.upper(),"interval":"1","limit":1},
-                         timeout=REQUEST_TIMEOUT)
-        if r2.status_code == 200:
-            jm = r2.json()
-            rows = (jm.get("result") or {}).get("list") or []
-            if rows and len(rows[0]) >= 5:
-                return to_float(rows[0][4])
     except Exception:
         pass
     return None
@@ -706,117 +623,62 @@ def mexc_mark_price(sym_native: str) -> Optional[float]:
     except Exception:
         pass
     return None
-import time
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 MEXC_SESSION = None
-
 def build_short_session(timeout: float = 6.0, retries: int = 1, backoff: float = 0.0):
-    """
-    Отдельная сессия для MEXC с коротким таймаутом и без длинных backoff/Retry-After.
-    """
     sess = requests.Session()
     retry = Retry(
-        total=retries,
-        connect=retries,
-        read=retries,
+        total=retries, connect=retries, read=retries,
         backoff_factor=backoff,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST"],
-        respect_retry_after_header=False,  # ВАЖНО: не ждать 60с по Retry-After
+        respect_retry_after_header=False,
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
     sess.mount("https://", adapter)
     sess.mount("http://", adapter)
     sess.headers.update({"User-Agent": "FundingScanner/fast-mexc"})
-    # кастомные поля, если используешь их где-то
     sess.request_timeout = timeout
     return sess
 
 def mexc_funding(symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Получить текущий funding rate по MEXC (8h cycle).
-    Требует вспомогательные функции/переменные:
-      - mexc_symbol(symbol: str) -> str      # 'YGGUSDT' -> 'YGG_USDT'
-      - mexc_mark_price(sym_native: str)     # mark/fair price
-      - build_short_session(...)             # быстрая requests-сессия
-      - глобальная MEXC_SESSION
-    Возвращает dict:
-      {"exchange","symbol","price","rate_8h","ts","next_funding_time"}
-    """
-    import time
     global MEXC_SESSION
     if MEXC_SESSION is None:
         MEXC_SESSION = build_short_session(timeout=6.0, retries=1, backoff=0.0)
-
     base = "https://contract.mexc.com"
-    sym_native = mexc_symbol(symbol)  # e.g. 'YGGUSDT' -> 'YGG_USDT'
+    sym_native = mexc_symbol(symbol)
     path = f"/api/v1/contract/funding_rate/{sym_native}"
-
     t0 = time.time()
     try:
-        r = MEXC_SESSION.get(
-            base + path,
-            timeout=getattr(MEXC_SESSION, "request_timeout", 6.0)
-        )
+        r = MEXC_SESSION.get(base + path, timeout=getattr(MEXC_SESSION, "request_timeout", 6.0))
         dt = (time.time() - t0) * 1000
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            logging.debug("MEXC HTTP %s %s -> %s in %.0fms", path, sym_native, r.status_code, dt)
-
-        # быстрый retry на 429 — без длинных backoff'ов
+        logging.debug("MEXC HTTP %s %s -> %s in %.0fms", path, sym_native, r.status_code, dt)
         if r.status_code == 429:
             time.sleep(1.5)
-            r = MEXC_SESSION.get(
-                base + path,
-                timeout=getattr(MEXC_SESSION, "request_timeout", 6.0)
-            )
-
+            r = MEXC_SESSION.get(base + path, timeout=getattr(MEXC_SESSION, "request_timeout", 6.0))
         if r.status_code != 200:
             return None
-
         j = r.json()
-        # ожидаемый формат: {"success":true, "code":0, "data":{...}}
         rec = (j.get("data") if isinstance(j, dict) else None) or {}
         if not rec:
             logging.debug("MEXC funding empty data for %s: %s", sym_native, str(j)[:200])
             return None
-
-        rate = rec.get("fundingRate")
-        ts = rec.get("timestamp")            # мс или сек?
-        next_time = rec.get("nextSettleTime")
-
-        # нормализация типов
-        try:
-            rate = float(rate)
-        except Exception:
-            rate = None
-
+        rate = to_float(rec.get("fundingRate"))
+        ts   = rec.get("timestamp")
+        nxt  = rec.get("nextSettleTime")
         def _to_ms(x):
             try:
-                v = int(x)
-                return v * 1000 if v < 10**12 else v
+                v = int(x);  return v*1000 if v < 10**12 else v
             except Exception:
                 return None
-
-        ts_ms = _to_ms(ts)
-        next_ms = _to_ms(next_time)
-
         price = mexc_mark_price(sym_native)
-
         return {
-            "exchange": "mexc",
-            "symbol": symbol.upper(),
-            "price": price,
-            "rate_8h": rate,               # MEXC — 8h cycle
-            "ts": ts_ms,
-            "next_funding_time": next_ms,
+            "exchange":"mexc","symbol":symbol.upper(),"price":price,
+            "rate_8h":rate,"ts":_to_ms(ts),"next_funding_time":_to_ms(nxt)
         }
-
     except Exception as e:
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            logging.debug("MEXC funding error %s: %s", sym_native, e)
+        logging.debug("MEXC funding error %s: %s", sym_native, e)
         return None
 
 # KuCoin Futures
@@ -879,7 +741,7 @@ def deribit_funding(symbol: str) -> Optional[Dict[str, Any]]:
             return None
         j = r.json()
         d = j.get("result") or {}
-        rate = to_float(d.get("data"))  # трактуем как 8h (некоторые инсталляции отдают hourly — учти при анализе)
+        rate = to_float(d.get("data"))
         price = deribit_mark_price(inst)
         return {"exchange":"deribit","symbol":symbol.upper(),"price":price,"rate_8h":rate,"next_funding_time":None,"ts":utc_ms_now()}
     except Exception:
@@ -967,8 +829,7 @@ def phemex_mark_price(sym_native: str) -> Optional[float]:
         if r.status_code == 200:
             j = r.json()
             d = (j.get("result") or {})
-            if isinstance(d, dict):
-                d = d.get("tickers") or []
+            if isinstance(d, dict): d = d.get("tickers") or []
             if isinstance(d, list) and d:
                 item = d[0]
                 ep = to_float(item.get("markPriceEp"))
@@ -1020,8 +881,7 @@ def krakenf_funding(symbol: str) -> Optional[Dict[str, Any]]:
         if r.status_code != 200:
             return None
         arr = (r.json().get("instruments") or [])
-        rate = None
-        next_ts = None
+        rate = None; next_ts = None
         for it in arr:
             if it.get("symbol") == sym_native:
                 rate = to_float(it.get("fundingRate8h"))
@@ -1051,7 +911,7 @@ def binance_futures_order(symbol: str, side: str, qty: float, reduce_only: bool=
     url = f"{binance_fapi_base()}/fapi/v1/order"
     data = {
         "symbol": symbol.upper(),
-        "side": side.upper(),                     # BUY / SELL
+        "side": side.upper(),
         "type": "MARKET",
         "quantity": qty,
         "reduceOnly": "true" if reduce_only else "false",
@@ -1073,7 +933,6 @@ def bybit_signed(params: dict) -> dict:
     api_secret = os.getenv("BYBIT_API_SECRET", "")
     ts = str(int(time.time()*1000))
     recv = "5000"
-    # v5 sign
     param_str = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
     sign_str = ts + api_key + recv + param_str
     sig = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
@@ -1092,7 +951,7 @@ def bybit_place_order(symbol: str, side: str, qty: float, reduce_only: bool=Fals
     params = {
         "category": "linear",
         "symbol": symbol.upper(),
-        "side": side.upper(),                 # Buy / Sell
+        "side": side.upper(),
         "orderType": "Market",
         "qty": str(qty),
         "reduceOnly": reduce_only,
@@ -1116,22 +975,20 @@ def _qty_from_notional(price: float, notional: float) -> float:
 
 def execute_open_perp_pair(long_ex: str, short_ex: str, symbol: str, price: float, per_leg_notional_usd: float):
     qty = _qty_from_notional(price, per_leg_notional_usd)
-    # LONG leg
     if long_ex == "binance": binance_futures_order(symbol, "BUY", qty, reduce_only=False)
     if long_ex == "bybit":   bybit_place_order(symbol, "Buy", qty, reduce_only=False)
-    # SHORT leg
     if short_ex == "binance": binance_futures_order(symbol, "SELL", qty, reduce_only=False)
     if short_ex == "bybit":   bybit_place_order(symbol, "Sell", qty, reduce_only=False)
 
 def execute_close_perp_pair(long_ex: str, short_ex: str, symbol: str, price: float, per_leg_notional_usd: float):
     qty = _qty_from_notional(price, per_leg_notional_usd)
-    # закрываем встречными
     if long_ex == "binance": binance_futures_order(symbol, "SELL", qty, reduce_only=True)
     if long_ex == "bybit":   bybit_place_order(symbol, "Sell", qty, reduce_only=True)
     if short_ex == "binance": binance_futures_order(symbol, "BUY", qty, reduce_only=True)
     if short_ex == "bybit":   bybit_place_order(symbol, "Buy", qty, reduce_only=True)
+
 # ------------------------------
-# Binance Top symbols util
+# Binance Top symbols util (optional)
 # ------------------------------
 def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List[str]:
     try:
@@ -1144,11 +1001,10 @@ def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List
             and s.get("quoteAsset") == "USDT"
             and s.get("status") == "TRADING"
         }
-        t24 = SESSION.get(f"{binance_fapi_base()}/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT)
-        t24.raise_for_status()
-        rows = t24.json()
+        # TODO: заменить на fapi/v1/ticker/24hr при желании
+        t24 = SESSION.get(f"{binance_fapi_base()}/fapi/v1/ticker/24hr", timeout=REQUEST_TIMEOUT)
         items = []
-        for r in rows:
+        for r in t24.json():
             sym = r.get("symbol")
             if sym in perp_usdt:
                 qv = to_float(r.get("quoteVolume")) or 0.0
@@ -1176,7 +1032,7 @@ top_n = int(getenv_float("TOP_N", 200))
 min_quote = float(getenv_float("MIN_QUOTE_USDT", 10_000_000))
 
 # Путь к матрице и режим выбора из неё
-matrix_path = getenv_str("MATRIX_READ_PATH", "gs://thinarthrillbucket/funding_scanner/matrix_union.csv")
+matrix_path = getenv_str("MATRIX_READ_PATH", "")
 matrix_mode = getenv_str("MATRIX_MODE", "union")  # union | intersection | atleast:k
 use_per_ex = getenv_bool("MATRIX_USE_PER_EXCHANGE", True)
 
@@ -1185,11 +1041,10 @@ if src == "manual" and symbols_env:
 elif src == "binance-top":
     symbols = binance_top_perp_usdt(top_n=top_n, min_quote_usdt=min_quote)
 elif src == "union":
-    # «на лету» собирать union по API как раньше — можно, но лучше взять из матрицы, если задана
     if matrix_path:
         symbols = symbols_from_matrix(matrix_path, exchanges, mode="union")
     else:
-        symbols = COMMON_SYMBOLS  # фолбэк
+        symbols = COMMON_SYMBOLS
 elif src == "common":
     symbols = COMMON_SYMBOLS
 elif src == "matrix":
@@ -1203,11 +1058,9 @@ else:
 
 logging.info("Symbols selected (%d): %s", len(symbols), symbols[:20])
 
-# Если хотим ещё точнее — использовать матрицу ПО-БИРЖАМ:
 symbols_by_ex: Optional[Dict[str, List[str]]] = None
 if use_per_ex and matrix_path:
     symbols_by_ex = matrix_by_exchange(matrix_path, exchanges)
-    # На всякий случай — ограничим словари только теми символами, что попали в итоговый набор 'symbols'
     symbols_set = set(symbols)
     for ex in list(symbols_by_ex.keys()):
         symbols_by_ex[ex] = sorted(list(symbols_set.intersection(symbols_by_ex.get(ex, []))))
@@ -1215,13 +1068,11 @@ if use_per_ex and matrix_path:
 def scan_all(exchanges: List[str], symbols: List[str], symbols_by_ex: Optional[Dict[str, List[str]]] = None) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for ex in exchanges:
-        # подберём подходящий список тикеров
         ex_symbols = symbols_by_ex.get(ex) if symbols_by_ex else None
         if ex_symbols is None:
             ex_symbols = symbols
         if not ex_symbols:
             continue
-
         for sym in ex_symbols:
             row = None
             if ex == "binance":
@@ -1244,7 +1095,7 @@ def scan_all(exchanges: List[str], symbols: List[str], symbols_by_ex: Optional[D
                 row = phemex_funding(sym)
             elif ex == "krakenf":
                 row = krakenf_funding(sym)
-            
+
             if logging.getLogger().isEnabledFor(logging.DEBUG):
                 logging.debug("Scanned %s %s", ex, sym)
 
@@ -1262,40 +1113,471 @@ def scan_all(exchanges: List[str], symbols: List[str], symbols_by_ex: Optional[D
     return pd.DataFrame(rows)
 
 # ------------------------------
-# Availability Matrix (встроено)
+# Funding → кросс-биржевые кандидаты
 # ------------------------------
-def _std_from_binance(sym: str) -> str: return sym.upper()
-def _std_from_underscore(s: str) -> str:
-    s = s.upper().replace("-", "_")
-    if "_" in s:
-        a,b=s.split("_",1)
-        return a+b
-    return s
-def _std_from_suffix(s: str, suf: str) -> str:
-    s = s.upper()
-    if s.endswith(suf.upper()): return s[:-len(suf)]
-    return s
-def _std_from_kucoin(s: str) -> str: return s[:-1] if s.upper().endswith("M") else s.upper()
-def _std_from_okx_inst(inst: str) -> Optional[str]:
-    inst = inst.upper(); parts = inst.split("-")
-    if len(parts)>=3 and parts[-1]=="SWAP": return parts[0]+parts[1]
-    return None
-def _std_from_krakenf(sym: str) -> Optional[str]:
-    s = sym.upper()
-    if not s.startswith("PI_"): return None
-    s = s[3:].replace("XBT","BTC")
-    return s
-def _std_from_deribit(inst: str) -> Optional[str]:
-    inst = inst.upper()
-    if inst.endswith("-PERPETUAL"): return inst.replace("-PERPETUAL","")+"USD"
-    return None
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _hours_between(ts_ms_a: int, ts_ms_b: int) -> float:
+    return abs(ts_ms_a - ts_ms_b) / 3_600_000.0
+
+def _taker_fee_for(ex: str, default_fee: float) -> float:
+    per_ex = {"bybit": 0.00055}  # можно расширять
+    return float(per_ex.get(ex, default_fee))
+
+def build_cross_exchange_candidates(
+    df_raw: pd.DataFrame,
+    expected_h: float,
+    per_leg_notional_usd: float,
+    default_fee: float,
+) -> pd.DataFrame:
+    if df_raw.empty:
+        return pd.DataFrame()
+    use = df_raw[["exchange","symbol","apr","rate_8h","next_funding_utc","time_utc"]].copy()
+    use["exchange"] = use["exchange"].str.lower()
+    use["symbol"] = use["symbol"].str.upper()
+    use = use.dropna(subset=["apr"])
+    symbols = use["symbol"].unique().tolist()
+    rows = []
+    hours_frac = max(0.0, float(expected_h)) / (24.0 * 365.0)
+    for sym in symbols:
+        sub = use[use["symbol"] == sym]
+        if len(sub) < 2: continue
+        pos = sub[sub["apr"] > 0.0]
+        neg = sub[sub["apr"] < 0.0]
+        if pos.empty or neg.empty: continue
+        for _, r_pos in pos.iterrows():
+            for _, r_neg in neg.iterrows():
+                ex_short = r_pos["exchange"]
+                ex_long  = r_neg["exchange"]
+                apr_short = float(r_pos["apr"])
+                apr_long_abs = abs(float(r_neg["apr"]))
+                apr_combo = apr_short + apr_long_abs
+                fee_short = _taker_fee_for(ex_short, default_fee)
+                fee_long  = _taker_fee_for(ex_long,  default_fee)
+                fees_usd  = per_leg_notional_usd * (2*fee_short + 2*fee_long)
+                funding_usd = per_leg_notional_usd * apr_combo * hours_frac
+                net_usd = funding_usd - fees_usd
+                days = max(1e-9, expected_h / 24.0)
+                funding_day_usd = per_leg_notional_usd * (apr_combo / 365.0)
+                fees_day_usd = fees_usd / days
+                net_day_usd = funding_day_usd - fees_day_usd
+                rows.append({
+                    "symbol": sym, "long_ex": ex_long, "short_ex": ex_short,
+                    "apr_long_abs": apr_long_abs, "apr_short": apr_short, "apr_combo": apr_combo,
+                    "exp_hours": expected_h, "funding_usd": round(funding_usd, 4),
+                    "fees_usd": round(fees_usd, 4), "net_usd": round(net_usd, 4),
+                    "funding_day_usd": round(funding_day_usd, 4),
+                    "fees_day_usd": round(fees_day_usd, 4),
+                    "net_day_usd": round(net_day_usd, 4),
+                })
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["net_usd","apr_combo"], ascending=[False, False]).reset_index(drop=True)
+    return out
+
+# ------------------------------
+# Пэйпер-симуляция + реальное исполнение (cross-ex)
+# ------------------------------
+def positions_open_close_loop(
+    df_raw: pd.DataFrame,
+    best_row: Optional[pd.Series],
+    per_leg_notional_usd: float,
+    entry_apr_threshold: float,
+    exit_apr_threshold: float,
+    max_holding_h: float,
+    default_fee: float,
+    pos_path: str,
+    paper: bool = True,
+) -> list[str]:
+    messages: list[str] = []
+    now_ms = _now_ms()
+
+    df_pos = load_positions_df(pos_path)
+    if df_pos.empty:
+        df_pos = pd.DataFrame(columns=[
+            "id","symbol","long_ex","short_ex","opened_ms","last_ms",
+            "size_usd","open_apr_combo","status","accrued_usd","open_note","held_h"
+        ])
+
+    apr_map = {}
+    for _, r in df_raw[["exchange","symbol","apr"]].dropna().iterrows():
+        apr_map[(str(r["exchange"]).lower(), str(r["symbol"]).upper())] = float(r["apr"])
+
+    # обновление открытых
+    for i in range(len(df_pos)):
+        if str(df_pos.at[i,"status"]) != "open":
+            continue
+        long_ex  = str(df_pos.at[i,"long_ex"])
+        short_ex = str(df_pos.at[i,"short_ex"])
+        sym      = str(df_pos.at[i,"symbol"]).upper()
+        last_ms  = int(df_pos.at[i,"last_ms"] or df_pos.at[i,"opened_ms"])
+        held_h   = float(df_pos.at[i].get("held_h", 0.0))
+
+        apr_long  = apr_map.get((long_ex, sym), 0.0)
+        apr_short = apr_map.get((short_ex, sym), 0.0)
+        apr_combo = abs(min(0.0, apr_long)) + max(0.0, apr_short)
+
+        dt_h = _hours_between(now_ms, last_ms)
+        df_pos.at[i,"held_h"] = held_h + dt_h
+
+        combo_frac = (dt_h / (24.0 * 365.0))
+        delta_usd = per_leg_notional_usd * (apr_combo * combo_frac)
+        df_pos.at[i,"accrued_usd"] = float(df_pos.at[i].get("accrued_usd", 0.0)) + delta_usd
+        df_pos.at[i,"last_ms"] = now_ms
+
+        do_close = False; reason = ""
+        if apr_combo*100.0 < float(exit_apr_threshold):
+            do_close = True; reason = f"APR fell below EXIT ({apr_combo*100:.2f}% < {exit_apr_threshold:.2f}%)"
+        if df_pos.at[i,"held_h"] >= float(max_holding_h):
+            do_close = True; reason = f"MAX_HOLDING_H reached ({df_pos.at[i]['held_h']:.1f}h)"
+
+        if do_close:
+            if not paper:
+                px_long  = None; px_short = None
+                try:
+                    px_long  = float(df_raw[(df_raw["exchange"]==long_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
+                except Exception: pass
+                try:
+                    px_short = float(df_raw[(df_raw["exchange"]==short_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
+                except Exception: pass
+                px = px_long or px_short
+                execute_close_perp_pair(long_ex, short_ex, sym, px or 0.0, per_leg_notional_usd)
+                try: verify_testnet_positions(sym)
+                except Exception as _e: logging.debug("verify positions (close) err: %s", _e)
+
+            fee_long  = _taker_fee_for(long_ex, default_fee)
+            fee_short = _taker_fee_for(short_ex, default_fee)
+            exit_fees = per_leg_notional_usd * (fee_long + fee_short) * 2
+            pnl = float(df_pos.at[i,"accrued_usd"]) - exit_fees
+            df_pos.at[i,"status"] = "closed"
+            df_pos.at[i,"closed_ms"] = now_ms
+            df_pos.at[i,"pnl_usd"] = round(pnl, 4)
+            df_pos.at[i,"close_note"] = reason
+
+            held_h = float(df_pos.at[i, "held_h"])
+            avg_day = (float(df_pos.at[i,"pnl_usd"]) / max(1e-9, held_h/24.0))
+            msg = (
+                f"✅ <b>Closed</b> {sym}\n"
+                f"LONG {long_ex.upper()} / SHORT {short_ex.upper()}\n"
+                f"Held: {held_h:.1f}h | APR_now: {apr_combo*100:.2f}%\n"
+                f"Accrued: ${float(df_pos.at[i,'accrued_usd']):.2f}\n"
+                f"Exit fees: ${exit_fees:.2f}\n"
+                f"<b>PNL:</b> ${pnl:.2f} | <b>Avg/day:</b> ${avg_day:.2f}\n"
+                f"Reason: {reason}"
+            )
+            messages.append(msg)
+
+    # открыть новую
+    if best_row is not None and not df_raw.empty:
+        apr_combo_pct = float(best_row["apr_combo"]) * 100.0
+        if apr_combo_pct >= float(entry_apr_threshold):
+            long_ex  = str(best_row["long_ex"])
+            short_ex = str(best_row["short_ex"])
+            sym      = str(best_row["symbol"]).upper()
+            exists = False
+            for _, p in df_pos.iterrows():
+                if p.get("status") == "open" and p.get("symbol")==sym and p.get("long_ex")==long_ex and p.get("short_ex")==short_ex:
+                    exists = True; break
+            if not exists:
+                fee_long  = _taker_fee_for(long_ex, default_fee)
+                fee_short = _taker_fee_for(short_ex, default_fee)
+                entry_fees = per_leg_notional_usd * (fee_long + fee_short) * 2
+                cur_max = None
+                if "id" in df_pos.columns:
+                    cur_max = pd.to_numeric(df_pos["id"], errors="coerce").max()
+                next_id = int(cur_max) + 1 if (cur_max is not None and pd.notna(cur_max)) else 1
+                new = {
+                    "id": next_id, "symbol": sym,
+                    "long_ex": long_ex, "short_ex": short_ex,
+                    "opened_ms": now_ms, "last_ms": now_ms, "held_h": 0.0,
+                    "size_usd": per_leg_notional_usd,
+                    "open_apr_combo": float(best_row["apr_combo"]),
+                    "status": "open",
+                    "accrued_usd": -entry_fees,
+                    "open_note": f"entry fees ${entry_fees:.2f}",
+                }
+                from pandas import concat
+                df_pos = concat([df_pos, pd.DataFrame([new])], ignore_index=True)
+                if not paper:
+                    px = float(best_row.get("entry_price") or 0.0)
+                    if px <= 0.0:
+                        try:
+                            px = float(df_raw[(df_raw["exchange"]==long_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
+                        except Exception:
+                            px = None
+                    execute_open_perp_pair(long_ex, short_ex, sym, px or 0.0, per_leg_notional_usd)
+                    try: verify_testnet_positions(sym)
+                    except Exception as _e: logging.debug("verify positions (open) err: %s", _e)
+
+                msg = (
+                    f"🚀 <b>Opened</b> {sym}\n"
+                    f"LONG {long_ex.upper()} / SHORT {short_ex.upper()}\n"
+                    f"Combo APR: {float(best_row['apr_combo'])*100:.2f}% | Size: ${per_leg_notional_usd:,.2f} per leg\n\n"
+                    f"<b>Profit/day (net):</b> ${float(best_row.get('net_day_usd', 0.0)):.2f}\n"
+                    f"  • Funding/day: ${float(best_row.get('funding_day_usd', 0.0)):.2f}\n"
+                    f"  • Fees/day: ${float(best_row.get('fees_day_usd', 0.0)):.2f}\n"
+                    f"<b>Expected ({int(best_row['exp_hours'])}h):</b> "
+                    f"${float(best_row.get('net_usd', 0.0)):.2f} after fees"
+                )
+                messages.append(msg)
+
+    save_positions_df(pos_path, df_pos)
+    return messages
+
+# ------------------------------
+# Main
+# ------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--noop", action="store_true")
+    args = ap.parse_args()
+
+    exchanges = [x.lower() for x in getenv_list("EXCHANGES", DEFAULT_EXCHANGES)]
+    top_n = int(getenv_float("TOP_N", 200))
+    min_quote_usdt = float(getenv_float("MIN_QUOTE_USDT", 1_000_000))
+
+    # Пути (с BACKET auto-prefix)
+    raw_csv_path = bucketize_path(getenv_str("RAW_CSV_PATH", ""))
+    log_csv_path = bucketize_path(getenv_str("LOG_CSV_PATH", "signals_log.csv"))
+    # НОВОЕ: раздельные файлы позиций
+    pos_cross_path   = bucketize_path(getenv_str("POS_CROSS_PATH", "positions_cross.csv"))
+    pos_signals_path = bucketize_path(getenv_str("POS_SIGNALS_PATH", "positions_signals.csv"))
+
+    entry_apr = float(getenv_float("ENTRY_APR", 15.0))
+    exit_apr  = float(getenv_float("EXIT_APR", 8.0))
+    max_holding_h = float(getenv_float("MAX_HOLDING_H", 48.0))
+
+    notional_env = getenv_str("NOTIONAL","")
+    notional = float(notional_env) if notional_env else None
+    capital = float(getenv_float("CAPITAL", 1000.0))
+    perp_leverage = float(getenv_float("PERP_LEVERAGE", 5.0))
+    taker_fee = float(getenv_float("TAKER_FEE", 0.0005))
+
+    if "bybit" in exchanges:
+        try:
+            f = bybit_get_fee("BTCUSDT")
+            if f:
+                maker_fee = f["maker"]
+                taker_fee = f["taker"]
+                logging.info("Bybit taker fee auto-set to %s", taker_fee)
+        except Exception as e:
+            logging.warning("Bybit auto-fee failed: %s", e)
+
+    borrow_apr = float(getenv_float("BORROW_APR", 0.10))
+    expected_holding_h = float(getenv_float("EXPECTED_HOLDING_H", 24.0))
+
+    MIN_NET_DAY_USD = float(getenv_float("MIN_NET_DAY_USD", 0.0))
+    MIN_PRICE = float(getenv_float("MIN_PRICE", 0.0))
+
+    top_n_tg = int(getenv_float("TOP_N_TELEGRAM", 3))
+    rotate = getenv_bool("ROTATE", False)
+    rotate_delta_usd = float(getenv_float("ROTATE_DELTA_USD", 0.0))
+
+    # Effective notional per leg
+    if notional is not None:
+        eff_notional = float(notional)
+    else:
+        eff_notional = leg_notional_from_capital(capital, perp_leverage)
+    logging.info("Effective per-leg notional = $%.2f (capital=%.2f, leverage=%.2f)", eff_notional, capital, perp_leverage)
+
+    # Scan
+    if symbols_by_ex:
+        for ex in exchanges:
+            logging.info("Will scan %s: %d symbols", ex, len(symbols_by_ex.get(ex, [])))
+    else:
+        logging.info("Will scan all exchanges with the same symbol set: %d", len(symbols))
+
+    df = scan_all(exchanges, symbols, symbols_by_ex=symbols_by_ex)
+
+    # ===== после df_raw = scan_all(...) =====
+
+    # единый флаг бумажного режима (PAPER_TRADING убран)
+    PAPER = getenv_bool("PAPER", True)
+    expected_h = float(getenv_float("EXPECTED_HOLDING_H", 72))
+    entry_apr = float(getenv_float("ENTRY_APR", 25))       # %
+    exit_apr  = float(getenv_float("EXIT_APR", 12))        # %
+    max_hold  = float(getenv_float("MAX_HOLDING_H", 72))   # h
+    default_fee = float(getenv_float("TAKER_FEE", 0.0005))
+
+    capital_env = float(getenv_float("CAPITAL", 1000))
+    lev     = float(getenv_float("PERP_LEVERAGE", 5))
+    per_leg_notional = max(10.0, round((capital_env * lev) / 2.0, 2))  # на каждую ногу
+
+    # кандидаты cross-ex
+    cands = build_cross_exchange_candidates(
+        df_raw=df, expected_h=expected_h,
+        per_leg_notional_usd=per_leg_notional,
+        default_fee=default_fee,
+    )
+    best = cands.iloc[0] if not cands.empty else None
+
+    # отправим карточку «лучший кросс» (информативно)
+    if best is not None:
+        expected_net = best['net_day_usd'] * (expected_h / 24.0)
+        msg = (
+            "📈 <b>Best cross-ex funding</b>\n"
+            f"<b>{best['symbol']}</b>: LONG {str(best['long_ex']).upper()} / SHORT {str(best['short_ex']).upper()}\n"
+            f"Combo APR: {float(best['apr_combo'])*100:.2f}%\n\n"
+            f"<b>Profit/day (net):</b> ${float(best['net_day_usd']):.2f}\n"
+            f"  • Funding/day: ${float(best['funding_day_usd']):.2f}\n"
+            f"  • Fees/day: ${float(best['fees_day_usd']):.2f}\n"
+            f"Expected ({int(expected_h)}h): ${expected_net:.2f}\n"
+            f"<b>Expected ({int(expected_h)}h):</b> ${float(best['net_usd']):.2f} "
+            f"(funding ${float(best['funding_usd']):.2f} − fees ${float(best['fees_usd']):.2f})"
+        )
+        maybe_send_telegram(msg)
+
+    # симуляция/исполнение + Telegram апдейты (кросс-позы)
+    events = positions_open_close_loop(
+        df_raw=df,
+        best_row=best,
+        per_leg_notional_usd=per_leg_notional,
+        entry_apr_threshold=entry_apr,
+        exit_apr_threshold=exit_apr,
+        max_holding_h=max_hold,
+        default_fee=default_fee,
+        pos_path=pos_cross_path,
+        paper=PAPER,
+    )
+    for e in events:
+        maybe_send_telegram(e)
+
+    # агрегаты и публикации для одиночных сигналов
+    if not df.empty:
+        gross_day, fees_day, borrow_day, net_day = [], [], [], []
+        hold_days = max(1.0/24.0, expected_holding_h/24.0)
+        fees_total = 4.0 * taker_fee * eff_notional  # entry+exit, spot+perp
+        fees_day_amort = fees_total / hold_days
+
+        for _, row in df.iterrows():
+            r8 = row.get("rate_8h") or 0.0
+            g = 3.0 * float(r8) * eff_notional
+            b = daily_borrow_cost_usd(eff_notional, borrow_apr) if row["direction"] == "LONG_PERP_SHORT_SPOT" else 0.0
+            gross_day.append(g); fees_day.append(fees_day_amort); borrow_day.append(b); net_day.append(g - fees_day_amort - b)
+
+        df["gross_day_usd"] = gross_day
+        df["fees_day_usd"]  = fees_day
+        df["borrow_day_usd"] = borrow_day
+        df["net_day_usd"]   = net_day
+
+        df = df[(~df["price"].isna()) & (df["price"] >= MIN_PRICE)]
+
+        if raw_csv_path:
+            append_csv(raw_csv_path, df)
+
+        # Positions & signals (single-exchange paper log)
+        pos_cols = ["exchange","symbol","direction","entry_time_utc","entry_ts","entry_rate_8h","entry_apr_pct","entry_price","notional_usd","net_day_usd"]
+        positions = read_csv(pos_signals_path, pos_cols)
+
+        log_cols = ["time_utc","action","exchange","symbol","direction","rate_8h","apr_pct","price","notional_usd","payout_8h_usd","payout_day_usd","reason"]
+        batch_logs = []
+
+        def current_row(ex, sym) -> Optional[pd.Series]:
+            sub = df[(df["exchange"]==ex) & (df["symbol"]==sym)]
+            if sub.empty: return None
+            return sub.iloc[0]
+
+        now_ms = utc_ms_now()
+        now_utc = fmt_ts(now_ms)
+
+        to_remove_idx = []
+        for i, pos in positions.iterrows():
+            ex, sym, dir_ = pos["exchange"], pos["symbol"], pos["direction"]
+            entry_ts = pos["entry_ts"]
+            cr = current_row(ex, sym)
+            if cr is None:
+                continue
+            apr_abs = abs(cr["apr_pct"]) if cr["apr_pct"] is not None else None
+            sign_flip = cr["direction"] != dir_ and cr["direction"] in ["SHORT_PERP_LONG_SPOT","LONG_PERP_SHORT_SPOT"]
+            holding_h = None
+            if entry_ts:
+                holding_h = round((now_ms - int(entry_ts)) / (1000*3600), 2)
+            reason = None
+            if apr_abs is not None and apr_abs < exit_apr:
+                reason = f"APR {apr_abs}% < exit {exit_apr}%"
+            if reason is None and holding_h is not None and holding_h >= max_holding_h:
+                reason = f"Max holding {holding_h}h ≥ {max_holding_h}h"
+            if reason is None and sign_flip:
+                reason = f"Direction flip {dir_} -> {cr['direction']}"
+            if reason:
+                payout8 = payout_8h_usd(cr["rate_8h"], eff_notional)
+                payoutd = payout_day_usd(cr["rate_8h"], eff_notional)
+                batch_logs.append({
+                    "time_utc": now_utc, "action":"CLOSE",
+                    "exchange": ex, "symbol": sym, "direction": dir_,
+                    "rate_8h": cr["rate_8h"], "apr_pct": cr["apr_pct"], "price": cr["price"],
+                    "notional_usd": eff_notional, "payout_8h_usd": payout8, "payout_day_usd": payoutd,
+                    "reason": reason
+                })
+                msg = (f"✅ <b>Funding CLOSE</b>\n"
+                       f"{ex.upper()} {sym}\n"
+                       f"APR: {cr['apr_pct']}% | 8h: {round((cr['rate_8h'] or 0)*100,6)}%\n"
+                       f"Dir: {dir_}\nReason: {reason}")
+                maybe_send_telegram(msg)
+                to_remove_idx.append(i)
+
+        if to_remove_idx:
+            positions = positions.drop(index=to_remove_idx).reset_index(drop=True)
+
+        candidates = df.copy()
+        candidates = candidates[
+            (candidates["apr_pct"].abs() >= entry_apr) &
+            (candidates["net_day_usd"] > MIN_NET_DAY_USD)
+        ]
+        candidates = candidates.sort_values("net_day_usd", ascending=False)
+
+        top_n_tg = max(0, int(top_n_tg))
+        if top_n_tg > 0 and not candidates.empty:
+            # ПУБЛИКУЕМ ДАЖЕ ЕСЛИ КАНДИДАТ ОДИН
+            publish_rows = candidates.iloc[:top_n_tg]
+            for _, r in publish_rows.iterrows():
+                if r["price"] is None or r["price"] < MIN_PRICE:
+                    continue
+                qty = hedge_qty(eff_notional, r["price"])
+                nf = r.get("next_funding_utc") or "n/a"
+                card = (
+                    "🚀 <b>Funding OPEN</b>\n"
+                    f"<b>{r['exchange'].upper()} {r['symbol']}</b>\n"
+                    f"<code>APR: {r['apr_pct']}% | 8h: {round((r['rate_8h'] or 0)*100,6)}%</code>\n"
+                    f"Dir: <b>{'Short perp & Long spot' if r['direction']=='SHORT_PERP_LONG_SPOT' else 'Long perp & Short spot'}</b>\n"
+                    f"Price: {r['price']} | Qty(est): {qty}\n"
+                    f"Next funding: {nf}\n\n"
+                    f"<b>Profit/day (net): ${round2(r['net_day_usd'])}</b>\n"
+                    f"  • Funding/day (gross): ${round2(r['gross_day_usd'])}\n"
+                    f"  • Fees/day (amort): ${round2(r['fees_day_usd'])}\n"
+                    f"  • Borrow/day: ${round2(r['borrow_day_usd'])}\n"
+                )
+                maybe_send_telegram(card)
+
+        # запись позиций/логов по single-signals
+        write_csv(pos_signals_path, positions)
+        if batch_logs:
+            append_csv(log_csv_path, pd.DataFrame(batch_logs))
+
+        try:
+            printable = df[["exchange","symbol","price","rate_8h","rate_8h_pct","apr_pct","net_day_usd","time_utc","next_funding_utc","direction"]]
+            print(printable.to_string(index=False))
+        except Exception:
+            print(df.head().to_string(index=False))
+    else:
+        print("No data rows.")
+
+    # ---- Доп: построить матрицу, если задан MATRIX_EXCHANGES ----
+    try:
+        run_matrix_from_env()
+    except Exception as e:
+        logging.warning("Matrix build failed: %s", e)
+
+# ===== Matrix build (optional from env)
+LISTERS = {}  # переопределяется ниже после всех lister_* объявлений
 
 def list_binance_perp_usdt() -> Set[str]:
     r = SESSION.get(f"{binance_fapi_base()}/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT); r.raise_for_status()
     out=set()
     for s in r.json().get("symbols", []):
         if s.get("contractType")=="PERPETUAL" and s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING":
-            out.add(_std_from_binance(s.get("symbol","")))
+            out.add(s.get("symbol","").upper())
     return out
 
 def lister_bybit() -> Set[str]:
@@ -1313,39 +1595,55 @@ def lister_okx() -> Set[str]:
     r = SESSION.get(f"{okx_base()}/api/v5/public/instruments", params={"instType":"SWAP"}, timeout=REQUEST_TIMEOUT); r.raise_for_status()
     out=set()
     for it in (r.json().get("data") or []):
-        std=_std_from_okx_inst(it.get("instId",""))
-        if std and (std.endswith("USDT") or std.endswith("USD")): out.add(std)
+        inst = it.get("instId","")
+        parts = inst.split("-")
+        if len(parts)>=3 and parts[-1]=="SWAP":
+            std = parts[0]+parts[1]
+            if std.endswith(("USDT","USD")):
+                out.add(std)
     return out
 
 def lister_mexc() -> Set[str]:
     r = SESSION.get("https://contract.mexc.com/api/v1/contract/detail", timeout=REQUEST_TIMEOUT); r.raise_for_status()
     out=set()
     for it in (r.json().get("data") or []):
-        std=_std_from_underscore(it.get("symbol",""))
-        if std.endswith("USDT") or std.endswith("USD"): out.add(std)
+        s = (it.get("symbol","") or "").upper().replace("-", "_")
+        if "_" in s:
+            a,b=s.split("_",1); std=a+b
+        else:
+            std=s
+        if std.endswith(("USDT","USD")):
+            out.add(std)
     return out
 
 def lister_kucoin() -> Set[str]:
     r = SESSION.get("https://api-futures.kucoin.com/api/v1/contracts/active", timeout=REQUEST_TIMEOUT); r.raise_for_status()
     out=set()
     for it in (r.json().get("data") or []):
-        std=_std_from_kucoin(it.get("symbol",""))
-        if std.endswith("USDT") or std.endswith("USD"): out.add(std)
+        sym = (it.get("symbol","") or "").upper()
+        if sym.endswith("M"): sym = sym[:-1]
+        if sym.endswith(("USDT","USD")): out.add(sym)
     return out
 
 def lister_bitget() -> Set[str]:
     r = SESSION.get("https://api.bitget.com/api/mix/v1/market/contracts", params={"productType":"umcbl"}, timeout=REQUEST_TIMEOUT); r.raise_for_status()
     out=set()
     for it in (r.json().get("data") or []):
-        std=_std_from_suffix(it.get("symbol",""), "_UMCBL")
-        if std.endswith("USDT"): out.add(std)
+        sym = (it.get("symbol","") or "").upper()
+        if sym.endswith("_UMCBL"):
+            sym = sym[:-6]
+        if sym.endswith("USDT"): out.add(sym)
     return out
 
 def lister_gate() -> Set[str]:
     r = SESSION.get("https://api.gateio.ws/api/v4/futures/usdt/contracts", timeout=REQUEST_TIMEOUT); r.raise_for_status()
     out=set()
     for it in r.json():
-        std=_std_from_underscore(it.get("name",""))
+        s = (it.get("name","") or "").upper().replace("-", "_")
+        if "_" in s:
+            a,b=s.split("_",1); std=a+b
+        else:
+            std=s
         if std.endswith("USDT"): out.add(std)
     return out
 
@@ -1355,12 +1653,9 @@ def lister_phemex() -> Set[str]:
     rows: Optional[List[AnyT]] = None
     if isinstance(j, dict):
         data=j.get("data")
-        if isinstance(data, dict):
-            rows=data.get("products")
-        elif isinstance(data, list):
-            rows=data
-        else:
-            rows=j.get("products") or j.get("result")
+        if isinstance(data, dict): rows=data.get("products")
+        elif isinstance(data, list): rows=data
+        else: rows=j.get("products") or j.get("result")
     elif isinstance(j, list):
         rows=j
     out=set()
@@ -1379,8 +1674,10 @@ def lister_krakenf() -> Set[str]:
     r = SESSION.get("https://futures.kraken.com/derivatives/api/v3/instruments", timeout=REQUEST_TIMEOUT); r.raise_for_status()
     out=set()
     for it in (r.json().get("instruments") or []):
-        std=_std_from_krakenf(it.get("symbol",""))
-        if std and (std.endswith("USDT") or std.endswith("USD")): out.add(std)
+        sym = (it.get("symbol","") or "").upper()
+        if not sym.startswith("PI_"): continue
+        std = sym[3:].replace("XBT","BTC")
+        if std.endswith(("USDT","USD")): out.add(std)
     return out
 
 def lister_deribit() -> Set[str]:
@@ -1391,8 +1688,10 @@ def lister_deribit() -> Set[str]:
                         timeout=REQUEST_TIMEOUT); r.raise_for_status()
         for it in (r.json().get("result") or []):
             if it.get("settlement_period")=="perpetual":
-                std=_std_from_deribit(it.get("instrument_name",""))
-                if std: out.add(std)
+                inst = (it.get("instrument_name","") or "").upper()
+                if inst.endswith("-PERPETUAL"):
+                    std = inst.replace("-PERPETUAL","")+"USD"
+                    out.add(std)
     return out
 
 LISTERS = {
@@ -1410,7 +1709,7 @@ LISTERS = {
 
 def build_availability_matrix(
     exchanges: List[str],
-    universe_mode: str = "common",         # common | binance-top | union | manual
+    universe_mode: str = "common",
     manual_symbols: Optional[List[str]] = None,
     top_n: int = 200,
     min_quote: float = 10_000_000,
@@ -1503,597 +1802,6 @@ def run_matrix_from_env() -> Optional[pd.DataFrame]:
             except Exception as e:
                 logging.warning("Failed to save matrix to file: %s", e)
     return df
-# ===== Funding → кросс-биржевые кандидаты =====
-# ===== Пэйпер-симуляция позиций (perp vs perp cross-ex) =====
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-def _hours_between(ts_ms_a: int, ts_ms_b: int) -> float:
-    return abs(ts_ms_a - ts_ms_b) / 3_600_000.0
-
-def positions_open_close_loop(
-    df_raw: pd.DataFrame,
-    best_row: Optional[pd.Series],
-    per_leg_notional_usd: float,
-    entry_apr_threshold: float,
-    exit_apr_threshold: float,
-    max_holding_h: float,
-    default_fee: float,
-    pos_path: str,
-    paper: bool = True,
-) -> list[str]:
-    """
-    Обновляет позы (открывает/закрывает) и возвращает список Telegram-сообщений.
-    Логика:
-      - если best_row есть и apr_combo >= ENTRY_APR — открыть, если нет активной по этой паре.
-      - для открытых поз — накапливаем PnL по времени (приближение), закрываем при apr_combo < EXIT_APR или по сроку.
-    """
-    messages: list[str] = []
-    now_ms = _now_ms()
-
-    # загрузить текущие позы
-    df_pos = load_positions_df(pos_path)
-    if df_pos.empty:
-        df_pos = pd.DataFrame(columns=[
-            "id","symbol","long_ex","short_ex","opened_ms","last_ms",
-            "size_usd","open_apr_combo","status","accrued_usd","open_note"
-        ])
-
-    # построим быструю карту текущих APR (чтобы апдейтить PnL)
-    apr_map = {}  # (ex,sym)->apr
-    for _, r in df_raw[["exchange","symbol","apr"]].dropna().iterrows():
-        apr_map[(str(r["exchange"]).lower(), str(r["symbol"]).upper())] = float(r["apr"])
-
-    # 1) апдейт открытых
-    for i in range(len(df_pos)):
-        if str(df_pos.at[i,"status"]) != "open":
-            continue
-        long_ex  = str(df_pos.at[i,"long_ex"])
-        short_ex = str(df_pos.at[i,"short_ex"])
-        sym      = str(df_pos.at[i,"symbol"]).upper()
-        last_ms  = int(df_pos.at[i,"last_ms"] or df_pos.at[i,"opened_ms"])
-        held_h   = float(df_pos.at[i].get("held_h", 0.0))
-
-        # текущие APR
-        apr_long  = apr_map.get((long_ex, sym), 0.0)
-        apr_short = apr_map.get((short_ex, sym), 0.0)
-        apr_combo = abs(min(0.0, apr_long)) + max(0.0, apr_short)  # сколько «получаем» сейчас
-
-        dt_h = _hours_between(now_ms, last_ms)
-        df_pos.at[i,"held_h"] = held_h + dt_h
-
-        # начислить за dt_h
-        combo_frac = (dt_h / (24.0 * 365.0))
-        delta_usd = per_leg_notional_usd * (apr_combo * combo_frac)
-        df_pos.at[i,"accrued_usd"] = float(df_pos.at[i].get("accrued_usd", 0.0)) + delta_usd
-        df_pos.at[i,"last_ms"] = now_ms
-
-        # критерии выхода
-        do_close = False
-        reason = ""
-        if apr_combo*100.0 < float(exit_apr_threshold):
-            do_close = True
-            reason = f"APR fell below EXIT ({apr_combo*100:.2f}% < {exit_apr_threshold:.2f}%)"
-        if df_pos.at[i,"held_h"] >= float(max_holding_h):
-            do_close = True
-            reason = f"MAX_HOLDING_H reached ({df_pos.at[i]['held_h']:.1f}h)"
-
-        if do_close:
-            # реальное закрытие на тестнетах
-            if not paper:
-                # возьмём price из текущей карты APR (лучше подать mark price при вызове)
-                px_long  = None
-                px_short = None
-                try:
-                    # если есть «сырой» df_raw с ценами — выберем подходящее
-                    px_long  = float(df_raw[(df_raw["exchange"]==long_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
-                except Exception: pass
-                try:
-                    px_short = float(df_raw[(df_raw["exchange"]==short_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
-                except Exception: pass
-                px = px_long or px_short
-                execute_close_perp_pair(long_ex, short_ex, sym, px or 0.0, per_leg_notional_usd)
-
-            # комиссии на выход
-            fee_long  = _taker_fee_for(long_ex, default_fee)
-            fee_short = _taker_fee_for(short_ex, default_fee)
-            exit_fees = per_leg_notional_usd * (fee_long + fee_short) * 2  # 2 ордера (закрытие 2 ног)
-            pnl = float(df_pos.at[i,"accrued_usd"]) - exit_fees
-            df_pos.at[i,"status"] = "closed"
-            df_pos.at[i,"closed_ms"] = now_ms
-            df_pos.at[i,"pnl_usd"] = round(pnl, 4)
-            df_pos.at[i,"close_note"] = reason
-
-            held_h = float(df_pos.at[i, "held_h"])
-            avg_day = (float(df_pos.at[i,"pnl_usd"]) / max(1e-9, held_h/24.0))
-            msg = (
-                f"✅ <b>Closed</b> {sym}\n"
-                f"LONG {long_ex.upper()} / SHORT {short_ex.upper()}\n"
-                f"Held: {held_h:.1f}h | APR_now: {apr_combo*100:.2f}%\n"
-                f"Accrued: ${float(df_pos.at[i,'accrued_usd']):.2f}\n"
-                f"Exit fees: ${exit_fees:.2f}\n"
-                f"<b>PNL:</b> ${pnl:.2f} | <b>Avg/day:</b> ${avg_day:.2f}\n"
-                f"Reason: {reason}"
-            )
-
-            messages.append(msg)
-
-    # 2) открыть новую, если есть сильный кандидат и нет открытой на ту же пару
-    if best_row is not None and not df_raw.empty:
-        apr_combo_pct = float(best_row["apr_combo"]) * 100.0
-        if apr_combo_pct >= float(entry_apr_threshold):
-            long_ex  = str(best_row["long_ex"])
-            short_ex = str(best_row["short_ex"])
-            sym      = str(best_row["symbol"]).upper()
-            # нет ли уже такой открытой?
-            exists = False
-            for _, p in df_pos.iterrows():
-                if p.get("status") == "open" and p.get("symbol")==sym and p.get("long_ex")==long_ex and p.get("short_ex")==short_ex:
-                    exists = True
-                    break
-            if not exists:
-                # комиссии на вход
-                fee_long  = _taker_fee_for(long_ex, default_fee)
-                fee_short = _taker_fee_for(short_ex, default_fee)
-                entry_fees = per_leg_notional_usd * (fee_long + fee_short) * 2  # 2 ордера (вход 2 ног)
-
-                cur_max = None
-                if "id" in df_pos.columns:
-                    cur_max = pd.to_numeric(df_pos["id"], errors="coerce").max()
-                next_id = int(cur_max) + 1 if (cur_max is not None and pd.notna(cur_max)) else 1
-
-                new = {
-                    "id": next_id,
-                    "symbol": sym,
-                    "long_ex": long_ex,
-                    "short_ex": short_ex,
-                    "opened_ms": now_ms,
-                    "last_ms": now_ms,
-                    "size_usd": per_leg_notional_usd,
-                    "open_apr_combo": float(best_row["apr_combo"]),
-                    "status": "open",
-                    "accrued_usd": -entry_fees,
-                    "open_note": f"entry fees ${entry_fees:.2f}",
-                    "held_h": 0.0,
-                }
-
-                df_pos = pd.concat([df_pos, pd.DataFrame([new])], ignore_index=True)
-                # реальное открытие на тестнетах
-                if not paper:
-                    px = float(best_row.get("entry_price") or 0.0)
-                    if px <= 0.0:
-                        try:
-                            px = float(df_raw[(df_raw["exchange"]==long_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
-                        except Exception:
-                            px = None
-                    execute_open_perp_pair(long_ex, short_ex, sym, px or 0.0, per_leg_notional_usd)
-
-                msg = (
-                    f"🚀 <b>Opened</b> {sym}\n"
-                    f"LONG {long_ex.upper()} / SHORT {short_ex.upper()}\n"
-                    f"Combo APR: {float(best_row['apr_combo'])*100:.2f}% | Size: ${per_leg_notional_usd:,.2f} per leg\n\n"
-                    f"<b>Profit/day (net):</b> ${float(best_row.get('net_day_usd', 0.0)):.2f}\n"
-                    f"  • Funding/day: ${float(best_row.get('funding_day_usd', 0.0)):.2f}\n"
-                    f"  • Fees/day: ${float(best_row.get('fees_day_usd', 0.0)):.2f}\n"
-                    f"<b>Expected ({int(best_row['exp_hours'])}h):</b> "
-                    f"${float(best_row.get('net_usd', 0.0)):.2f} after fees"
-                )
-
-                messages.append(msg)
-
-    # сохранить позы
-    save_positions_df(pos_path, df_pos)
-    return messages
-
-def _taker_fee_for(ex: str, default_fee: float) -> float:
-    # при желании заполни реальными комиссиями по биржам
-    per_ex = {
-        "bybit": 0.00055,
-        # "binance": 0.0004,
-        # "okx": 0.0005,
-        # ...
-    }
-    return float(per_ex.get(ex, default_fee))
-
-def build_cross_exchange_candidates(
-    df_raw: pd.DataFrame,
-    expected_h: float,
-    per_leg_notional_usd: float,
-    default_fee: float,
-) -> pd.DataFrame:
-    """
-    Находит пары бирж для одного и того же символа, где
-    на одной funding APR > 0 (SHORT получает), а на другой APR < 0 (LONG получает).
-    Возвращает DataFrame, отсортированный по ожидаемой прибыли (USD) за expected_h.
-    """
-    if df_raw.empty:
-        return pd.DataFrame()
-
-    # нормализуем
-    use = df_raw[["exchange","symbol","apr","rate_8h","next_funding_utc","time_utc"]].copy()
-    use["exchange"] = use["exchange"].str.lower()
-    use["symbol"] = use["symbol"].str.upper()
-    use = use.dropna(subset=["apr"])
-
-    # по символам — строим список строк
-    symbols = use["symbol"].unique().tolist()
-    rows = []
-    hours_frac = max(0.0, float(expected_h)) / (24.0 * 365.0)  # доля года
-
-    for sym in symbols:
-        sub = use[use["symbol"] == sym]
-        if len(sub) < 2:
-            continue
-        # положительные (SHORT получает), отрицательные (LONG получает)
-        pos = sub[sub["apr"] > 0.0]
-        neg = sub[sub["apr"] < 0.0]
-        if pos.empty or neg.empty:
-            continue
-
-        for _, r_pos in pos.iterrows():
-            for _, r_neg in neg.iterrows():
-                ex_short = r_pos["exchange"]  # там шортим перп (получаем +APR)
-                ex_long  = r_neg["exchange"]  # там лонг перп (получаем |APR|)
-                apr_short = float(r_pos["apr"])
-                apr_long_abs = abs(float(r_neg["apr"]))
-                apr_combo = apr_short + apr_long_abs  # комбинированный APR «получаем»
-
-                # комиссии (в USD) — 2 ордера на вход + 2 на выход (вход+выход обеих ног)
-                fee_short = _taker_fee_for(ex_short, default_fee)
-                fee_long  = _taker_fee_for(ex_long,  default_fee)
-                fees_usd  = per_leg_notional_usd * (2*fee_short + 2*fee_long)
-
-                # funding за весь горизонт expected_h
-                funding_usd = per_leg_notional_usd * apr_combo * hours_frac
-                net_usd = funding_usd - fees_usd
-
-                # агрегаты «в день» (унификация с Funding OPEN)
-                days = max(1e-9, expected_h / 24.0)
-                funding_day_usd = per_leg_notional_usd * (apr_combo / 365.0)
-                fees_day_usd = fees_usd / days
-                net_day_usd = funding_day_usd - fees_day_usd
-
-                rows.append({
-                    "symbol": sym,
-                    "long_ex": ex_long,
-                    "short_ex": ex_short,
-                    "apr_long_abs": apr_long_abs,
-                    "apr_short": apr_short,
-                    "apr_combo": apr_combo,           # доля, не %
-                    "exp_hours": expected_h,
-                    "funding_usd": round(funding_usd, 4),
-                    "fees_usd": round(fees_usd, 4),
-                    "net_usd": round(net_usd, 4),
-                    "funding_day_usd": round(funding_day_usd, 4),
-                    "fees_day_usd": round(fees_day_usd, 4),
-                    "net_day_usd": round(net_day_usd, 4),
-                })
-
-
-
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out = out.sort_values(["net_usd","apr_combo"], ascending=[False, False]).reset_index(drop=True)
-    return out
-
-# ------------------------------
-# Main
-# ------------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--noop", action="store_true")
-    args = ap.parse_args()
-
-    exchanges = [x.lower() for x in getenv_list("EXCHANGES", DEFAULT_EXCHANGES)]
-    top_n = int(getenv_float("TOP_N", 200))
-    min_quote_usdt = float(getenv_float("MIN_QUOTE_USDT", 1_000_000))
-
-    # Paths (with BACKET auto-prefix for relative paths)
-    raw_csv_path = bucketize_path(getenv_str("RAW_CSV_PATH", ""))
-    log_csv_path = bucketize_path(getenv_str("LOG_CSV_PATH", "signals_log.csv"))
-    positions_csv_path = bucketize_path(getenv_str("POSITIONS_CSV_PATH", "positions.csv"))
-
-    entry_apr = float(getenv_float("ENTRY_APR", 15.0))
-    exit_apr  = float(getenv_float("EXIT_APR", 8.0))
-    max_holding_h = float(getenv_float("MAX_HOLDING_H", 48.0))
-
-    notional_env = getenv_str("NOTIONAL","")
-    notional = float(notional_env) if notional_env else None
-    capital = float(getenv_float("CAPITAL", 1000.0))
-    perp_leverage = float(getenv_float("PERP_LEVERAGE", 5.0))
-    taker_fee = float(getenv_float("TAKER_FEE", 0.0005))
-
-    if "bybit" in exchanges:
-        try:
-            f = bybit_get_fee("BTCUSDT")
-            if f:
-                taker_fee = f
-                logging.info("Bybit taker fee auto-set to %s", taker_fee)
-        except Exception as e:
-            logging.warning("Bybit auto-fee failed: %s", e)
-
-    borrow_apr = float(getenv_float("BORROW_APR", 0.10))
-    expected_holding_h = float(getenv_float("EXPECTED_HOLDING_H", 24.0))
-
-    MIN_NET_DAY_USD = float(getenv_float("MIN_NET_DAY_USD", 0.0))
-    MIN_PRICE = float(getenv_float("MIN_PRICE", 0.0))
-
-    top_n_tg = int(getenv_float("TOP_N_TELEGRAM", 3))
-    rotate = getenv_bool("ROTATE", False)
-    rotate_delta_usd = float(getenv_float("ROTATE_DELTA_USD", 0.0))
-
-    # Effective notional per leg
-    if notional is not None:
-        eff_notional = float(notional)
-    else:
-        eff_notional = leg_notional_from_capital(capital, perp_leverage)
-    logging.info("Effective per-leg notional = $%.2f (capital=%.2f, leverage=%.2f)", eff_notional, capital, perp_leverage)
-
-    # Scan
-    if symbols_by_ex:
-        for ex in exchanges:
-            logging.info("Will scan %s: %d symbols", ex, len(symbols_by_ex.get(ex, [])))
-        else:
-            logging.info("Will scan all exchanges with the same symbol set: %d", len(symbols))
-    df = scan_all(exchanges, symbols, symbols_by_ex=symbols_by_ex)
-
-    # ===== после df_raw = scan_all(...) =====
-
-    # 1) параметры
-    paper = getenv_bool("PAPER_TRADING", True)
-    expected_h = float(getenv_float("EXPECTED_HOLDING_H", 72))
-    entry_apr = float(getenv_float("ENTRY_APR", 25))       # %
-    exit_apr  = float(getenv_float("EXIT_APR", 12))        # %
-    max_hold  = float(getenv_float("MAX_HOLDING_H", 72))   # h
-    default_fee = float(getenv_float("TAKER_FEE", 0.0005))
-
-    # размер позиции: если у тебя уже вычисляется «Effective per-leg notional», используй его.
-    # иначе — безопасный дефолт:
-    capital = float(getenv_float("CAPITAL", 1000))
-    lev     = float(getenv_float("PERP_LEVERAGE", 5))
-    per_leg_notional = max(10.0, round((capital * lev) / 2.0, 2))  # на каждую ногу
-
-    # 2) построить кандидатов cross-ex
-    cands = build_cross_exchange_candidates(
-        df_raw=df,
-        expected_h=expected_h,
-        per_leg_notional_usd=per_leg_notional,
-        default_fee=default_fee,
-    )
-
-    best = cands.iloc[0] if not cands.empty else None
-
-    # 3) выслать лучший сигнал в Telegram
-    if best is not None:
-        days = max(1e-9, expected_h / 24.0)
-        expected_h = float(getenv_float("EXPECTED_HOLDING_H", 72))
-        expected_net = best['net_day_usd'] * (expected_h / 24.0)  # net_day_usd = твой уже посчитанный Profit/day (net)
-        msg = (
-            "📈 <b>Best cross-ex funding</b>\n"
-            f"<b>{best['symbol']}</b>: LONG {str(best['long_ex']).upper()} / SHORT {str(best['short_ex']).upper()}\n"
-            f"Combo APR: {float(best['apr_combo'])*100:.2f}%\n\n"
-            f"<b>Profit/day (net):</b> ${float(best['net_day_usd']):.2f}\n"
-            f"  • Funding/day: ${float(best['funding_day_usd']):.2f}\n"
-            f"  • Fees/day: ${float(best['fees_day_usd']):.2f}\n"
-            f"Expected ({int(expected_h)}h): ${expected_net:.2f}\n"
-            f"<b>Expected ({int(expected_h)}h):</b> ${float(best['net_usd']):.2f} "
-            f"(funding ${float(best['funding_usd']):.2f} − fees ${float(best['fees_usd']):.2f})"
-        )
-        maybe_send_telegram(msg)
-        verify_testnet_positions(best['symbol'])  # после открытия/закрытия
-
-    # 4) симуляция открытия/закрытия + Telegram апдейты
-    pos_path = getenv_str("POSITIONS_CSV_PATH", "positions.csv")
-    PAPER = getenv_bool("PAPER", True)
-    events = positions_open_close_loop(
-        df_raw=df,
-        best_row=best,
-        per_leg_notional_usd=per_leg_notional,
-        entry_apr_threshold=entry_apr,
-        exit_apr_threshold=exit_apr,
-        max_holding_h=max_hold,
-        default_fee=default_fee,
-        pos_path=pos_path,
-        paper=PAPER,
-    )
-    for e in events:
-        maybe_send_telegram(e)
-
-    if not df.empty:
-        # Costs/PNL metrics
-        gross_day, fees_day, borrow_day, net_day = [], [], [], []
-        hold_days = max(1.0/24.0, expected_holding_h/24.0)
-        fees_total = 4.0 * taker_fee * eff_notional  # entry+exit, spot+perp
-        fees_day_amort = fees_total / hold_days
-
-        for _, row in df.iterrows():
-            r8 = row.get("rate_8h") or 0.0
-            g = 3.0 * float(r8) * eff_notional
-            b = daily_borrow_cost_usd(eff_notional, borrow_apr) if row["direction"] == "LONG_PERP_SHORT_SPOT" else 0.0
-            gross_day.append(g)
-            fees_day.append(fees_day_amort)
-            borrow_day.append(b)
-            net_day.append(g - fees_day_amort - b)
-
-        df["gross_day_usd"] = gross_day
-        df["fees_day_usd"]  = fees_day
-        df["borrow_day_usd"] = borrow_day
-        df["net_day_usd"]   = net_day
-
-        df = df[(~df["price"].isna()) & (df["price"] >= MIN_PRICE)]
-
-        if raw_csv_path:
-            append_csv(raw_csv_path, df)
-
-        # Positions & signals
-        pos_cols = ["exchange","symbol","direction","entry_time_utc","entry_ts","entry_rate_8h","entry_apr_pct","entry_price","notional_usd","net_day_usd"]
-        positions = read_csv(positions_csv_path, pos_cols)
-
-        log_cols = ["time_utc","action","exchange","symbol","direction","rate_8h","apr_pct","price","notional_usd","payout_8h_usd","payout_day_usd","reason"]
-        batch_logs = []
-
-        def current_row(ex, sym) -> Optional[pd.Series]:
-            sub = df[(df["exchange"]==ex) & (df["symbol"]==sym)]
-            if sub.empty: return None
-            return sub.iloc[0]
-
-        now_ms = utc_ms_now()
-        now_utc = fmt_ts(now_ms)
-
-        to_remove_idx = []
-        for i, pos in positions.iterrows():
-            ex, sym, dir_ = pos["exchange"], pos["symbol"], pos["direction"]
-            entry_ts = pos["entry_ts"]
-            cr = current_row(ex, sym)
-            if cr is None:
-                continue
-
-            apr_abs = abs(cr["apr_pct"]) if cr["apr_pct"] is not None else None
-            sign_flip = cr["direction"] != dir_ and cr["direction"] in ["SHORT_PERP_LONG_SPOT","LONG_PERP_SHORT_SPOT"]
-            holding_h = None
-            if entry_ts:
-                holding_h = round((now_ms - int(entry_ts)) / (1000*3600), 2)
-
-            reason = None
-            if apr_abs is not None and apr_abs < exit_apr:
-                reason = f"APR {apr_abs}% < exit {exit_apr}%"
-            if reason is None and holding_h is not None and holding_h >= max_holding_h:
-                reason = f"Max holding {holding_h}h ≥ {max_holding_h}h"
-            if reason is None and sign_flip:
-                reason = f"Direction flip {dir_} -> {cr['direction']}"
-
-            if reason:
-                payout8 = payout_8h_usd(cr["rate_8h"], eff_notional)
-                payoutd = payout_day_usd(cr["rate_8h"], eff_notional)
-                batch_logs.append({
-                    "time_utc": now_utc, "action":"CLOSE",
-                    "exchange": ex, "symbol": sym, "direction": dir_,
-                    "rate_8h": cr["rate_8h"], "apr_pct": cr["apr_pct"], "price": cr["price"],
-                    "notional_usd": eff_notional, "payout_8h_usd": payout8, "payout_day_usd": payoutd,
-                    "reason": reason
-                })
-                msg = (f"✅ <b>Funding CLOSE</b>\n"
-                       f"{ex.upper()} {sym}\n"
-                       f"APR: {cr['apr_pct']}% | 8h: {round((cr['rate_8h'] or 0)*100,6)}%\n"
-                       f"Dir: {dir_}\nReason: {reason}")
-                maybe_send_telegram(msg)
-                verify_testnet_positions(sym)  # после открытия/закрытия
-                to_remove_idx.append(i)
-
-        if to_remove_idx:
-            positions = positions.drop(index=to_remove_idx).reset_index(drop=True)
-
-        candidates = df.copy()
-        candidates = candidates[
-            (candidates["apr_pct"].abs() >= entry_apr) &
-            (candidates["net_day_usd"] > MIN_NET_DAY_USD)
-        ]
-        candidates = candidates.sort_values("net_day_usd", ascending=False)
-
-        top_n_tg = max(0, int(top_n_tg))
-        if top_n_tg > 0 and not candidates.empty:
-            publish_rows = candidates.iloc[:top_n_tg] if len(candidates) > 1 else pd.DataFrame(columns=candidates.columns)
-            for _, r in publish_rows.iterrows():
-                if r["price"] is None or r["price"] < MIN_PRICE:
-                    continue
-                qty = hedge_qty(eff_notional, r["price"])
-                nf = r.get("next_funding_utc") or "n/a"
-                card = (
-                    "🚀 <b>Funding OPEN</b>\n"
-                    f"<b>{r['exchange'].upper()} {r['symbol']}</b>\n"
-                    f"<code>APR: {r['apr_pct']}% | 8h: {round((r['rate_8h'] or 0)*100,6)}%</code>\n"
-                    f"Dir: <b>{'Short perp & Long spot' if r['direction']=='SHORT_PERP_LONG_SPOT' else 'Long perp & Short spot'}</b>\n"
-                    f"Price: {r['price']} | Qty(est): {qty}\n"
-                    f"Next funding: {nf}\n\n"
-                    f"<b>Profit/day (net): ${round2(r['net_day_usd'])}</b>\n"
-                    f"  • Funding/day (gross): ${round2(r['gross_day_usd'])}\n"
-                    f"  • Fees/day (amort): ${round2(r['fees_day_usd'])}\n"
-                    f"  • Borrow/day: ${round2(r['borrow_day_usd'])}\n"
-                )
-                maybe_send_telegram(card)
-                verify_testnet_positions(r['symbol'])  # после открытия/закрытия
-
-        current_pos = positions.iloc[0] if len(positions) > 0 else None
-        best = candidates.head(1)
-        if not best.empty:
-            r = best.iloc[0]
-            ex, sym, dir_ = r["exchange"], r["symbol"], r["direction"]
-
-            need_open = current_pos is None
-            if current_pos is not None:
-                same = (str(current_pos["exchange"]).lower() == ex) and (str(current_pos["symbol"]).upper() == sym)
-                if same:
-                    need_open = False
-                else:
-                    current_net = 0.0 if pd.isna(current_pos.get("net_day_usd", None)) else float(current_pos.get("net_day_usd", 0.0))
-                    delta_usd = float(r["net_day_usd"] or 0.0) - current_net
-                    if rotate and delta_usd > float(rotate_delta_usd):
-                        close_msg = (f"🔁 <b>Funding ROTATE</b>\n"
-                                     f"Close: {str(current_pos['exchange']).upper()} {str(current_pos['symbol']).upper()}\n"
-                                     f"Open:  {ex.upper()} {sym}\n"
-                                     f"Delta net/day: ${round2(delta_usd)}")
-                        maybe_send_telegram(close_msg)
-                        verify_testnet_positions(sym)  # после открытия/закрытия
-                        positions = positions.iloc[0:0]
-                        need_open = True
-                    else:
-                        need_open = False
-
-            if need_open and (r["price"] is not None) and (r["price"] >= MIN_PRICE):
-                entry_qty = hedge_qty(eff_notional, r["price"])
-                payout8 = payout_8h_usd(r["rate_8h"], eff_notional)
-                payoutd = r["gross_day_usd"]
-                nf = r.get("next_funding_utc") or "n/a"
-
-                card = (
-                    "🚀 <b>Funding OPEN</b>\n"
-                    f"<b>{ex.upper()} {sym}</b>\n"
-                    f"<code>APR: {r['apr_pct']}% | 8h: {round((r['rate_8h'] or 0)*100,6)}%</code>\n"
-                    f"Dir: <b>{'Short perp & Long spot' if dir_=='SHORT_PERP_LONG_SPOT' else 'Long perp & Short spot'}</b>\n"
-                    f"Price: {r['price']} | Qty(est): {entry_qty}\n"
-                    f"Next funding: {nf}\n\n"
-                    f"<b>Profit/day (net): ${round2(r['net_day_usd'])}</b>\n"
-                    f"  • Funding/day (gross): ${round2(r['gross_day_usd'])}\n"
-                    f"  • Fees/day (amort): ${round2(r['fees_day_usd'])}\n"
-                    f"  • Borrow/day: ${round2(r['borrow_day_usd'])}\n"
-                )
-                maybe_send_telegram(card)
-                verify_testnet_positions(sym)  # после открытия/закрытия
-
-                new_pos = {
-                    "exchange": ex, "symbol": sym, "direction": dir_,
-                    "entry_time_utc": r["time_utc"], "entry_ts": r["ts"],
-                    "entry_rate_8h": r["rate_8h"], "entry_apr_pct": r["apr_pct"],
-                    "entry_price": r["price"], "notional_usd": eff_notional,
-                    "net_day_usd": r["net_day_usd"]
-                }
-                positions = pd.DataFrame([new_pos], columns=list(new_pos.keys()))
-                batch_logs.append({
-                    "time_utc": now_utc, "action":"OPEN",
-                    "exchange": ex, "symbol": sym, "direction": dir_,
-                    "rate_8h": r["rate_8h"], "apr_pct": r["apr_pct"], "price": r["price"],
-                    "notional_usd": eff_notional, "payout_8h_usd": payout8, "payout_day_usd": payoutd,
-                    "reason": "best net/day"
-                })
-
-        write_csv(positions_csv_path, positions)
-        if batch_logs:
-            append_csv(log_csv_path, pd.DataFrame(batch_logs))
-
-        try:
-            printable = df[["exchange","symbol","price","rate_8h","rate_8h_pct","apr_pct","net_day_usd","time_utc","next_funding_utc","direction"]]
-            print(printable.to_string(index=False))
-        except Exception:
-            print(df.head().to_string(index=False))
-    else:
-        print("No data rows.")
-
-    # ---- ДОПОЛНИТЕЛЬНО: построить матрицу, если задан MATRIX_EXCHANGES ----
-    try:
-        run_matrix_from_env()
-    except Exception as e:
-        logging.warning("Matrix build failed: %s", e)
 
 if __name__ == "__main__":
     main()
