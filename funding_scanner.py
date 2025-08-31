@@ -726,77 +726,86 @@ def build_short_session(timeout: float = 6.0, retries: int = 1, backoff: float =
 
 def mexc_funding(symbol: str) -> Optional[Dict[str, Any]]:
     """
-    Быстрый запрос funding по MEXC c короткими таймаутами и без минутных бэк-оффов.
-    Примерный формат ответа остаётся как в старом коде: {exchange, symbol, rate_8h, ts, next_funding_time, ...}
+    Получить текущий funding rate по MEXC (8h cycle).
+    Требует вспомогательные функции/переменные:
+      - mexc_symbol(symbol: str) -> str      # 'YGGUSDT' -> 'YGG_USDT'
+      - mexc_mark_price(sym_native: str)     # mark/fair price
+      - build_short_session(...)             # быстрая requests-сессия
+      - глобальная MEXC_SESSION
+    Возвращает dict:
+      {"exchange","symbol","price","rate_8h","ts","next_funding_time"}
     """
+    import time
     global MEXC_SESSION
     if MEXC_SESSION is None:
         MEXC_SESSION = build_short_session(timeout=6.0, retries=1, backoff=0.0)
 
     base = "https://contract.mexc.com"
-    path = "/api/v1/contract/funding_rate/record"   # исторический/последний; если у тебя был другой — оставь свой
-    params = {"symbol": symbol, "page_size": 1}     # берём последнее значение
+    sym_native = mexc_symbol(symbol)  # e.g. 'YGGUSDT' -> 'YGG_USDT'
+    path = f"/api/v1/contract/funding_rate/{sym_native}"
 
     t0 = time.time()
     try:
-        r = MEXC_SESSION.get(base + path, params=params, timeout=getattr(MEXC_SESSION, "request_timeout", 6.0))
+        r = MEXC_SESSION.get(
+            base + path,
+            timeout=getattr(MEXC_SESSION, "request_timeout", 6.0)
+        )
         dt = (time.time() - t0) * 1000
         if logging.getLogger().isEnabledFor(logging.DEBUG):
-            logging.debug("MEXC HTTP %s %s -> %s in %.0fms", path, symbol, r.status_code, dt)
+            logging.debug("MEXC HTTP %s %s -> %s in %.0fms", path, sym_native, r.status_code, dt)
 
-        # Быстрая обработка 429: маленькая пауза и один ре-трай вручную (без минутных спячек)
+        # быстрый retry на 429 — без длинных backoff'ов
         if r.status_code == 429:
             time.sleep(1.5)
-            r = MEXC_SESSION.get(base + path, params=params, timeout=getattr(MEXC_SESSION, "request_timeout", 6.0))
+            r = MEXC_SESSION.get(
+                base + path,
+                timeout=getattr(MEXC_SESSION, "request_timeout", 6.0)
+            )
 
         if r.status_code != 200:
             return None
 
         j = r.json()
-        # Под разные форматы данных: берём последнюю запись, где есть rate/time
-        data = None
-        if isinstance(j, dict):
-            data = j.get("data") or j.get("result") or j.get("records") or j.get("list")
-        elif isinstance(j, list):
-            data = j
-
-        if not data:
+        # ожидаемый формат: {"success":true, "code":0, "data":{...}}
+        rec = (j.get("data") if isinstance(j, dict) else None) or {}
+        if not rec:
+            logging.debug("MEXC funding empty data for %s: %s", sym_native, str(j)[:200])
             return None
 
-        # Берём первую/последнюю запись
-        rec = data[0] if isinstance(data, list) else data
-        # Часто поля называются по-разному, пробуем несколько ключей:
-        rate = rec.get("fundingRate") or rec.get("rate") or rec.get("funding_rate")
-        ts   = rec.get("time") or rec.get("timestamp") or rec.get("createdTime") or rec.get("created_at")
+        rate = rec.get("fundingRate")
+        ts = rec.get("timestamp")            # мс или сек?
+        next_time = rec.get("nextSettleTime")
 
-        # Нормализуем типы
+        # нормализация типов
         try:
             rate = float(rate)
         except Exception:
             rate = None
 
-        # Переводим секунды → мс (если вдруг sec)
-        if ts is not None:
+        def _to_ms(x):
             try:
-                ts = int(ts)
-                if ts < 10**12:  # похоже на секунды
-                    ts *= 1000
+                v = int(x)
+                return v * 1000 if v < 10**12 else v
             except Exception:
-                ts = None
+                return None
 
-        row = {
+        ts_ms = _to_ms(ts)
+        next_ms = _to_ms(next_time)
+
+        price = mexc_mark_price(sym_native)
+
+        return {
             "exchange": "mexc",
-            "symbol": symbol,
-            "rate_8h": rate,              # если MEXC отдаёт не 8h — адаптируй ниже
-            "ts": ts,
-            "next_funding_time": None,    # при желании сделай отдельный вызов "next"
+            "symbol": symbol.upper(),
+            "price": price,
+            "rate_8h": rate,               # MEXC — 8h cycle
+            "ts": ts_ms,
+            "next_funding_time": next_ms,
         }
-
-        return row
 
     except Exception as e:
         if logging.getLogger().isEnabledFor(logging.DEBUG):
-            logging.debug("MEXC funding error %s: %s", symbol, e)
+            logging.debug("MEXC funding error %s: %s", sym_native, e)
         return None
 
 # KuCoin Futures
