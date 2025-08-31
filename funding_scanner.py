@@ -1456,15 +1456,18 @@ def positions_open_close_loop(
             df_pos.at[i,"pnl_usd"] = round(pnl, 4)
             df_pos.at[i,"close_note"] = reason
 
+            held_h = float(df_pos.at[i, "held_h"])
+            avg_day = (float(df_pos.at[i,"pnl_usd"]) / max(1e-9, held_h/24.0))
             msg = (
                 f"✅ <b>Closed</b> {sym}\n"
                 f"LONG {long_ex.upper()} / SHORT {short_ex.upper()}\n"
-                f"Held: {df_pos.at[i,'held_h']:.1f}h | APR_now: {apr_combo*100:.2f}%\n"
+                f"Held: {held_h:.1f}h | APR_now: {apr_combo*100:.2f}%\n"
                 f"Accrued: ${float(df_pos.at[i,'accrued_usd']):.2f}\n"
                 f"Exit fees: ${exit_fees:.2f}\n"
-                f"<b>PNL:</b> ${pnl:.2f}\n"
+                f"<b>PNL:</b> ${pnl:.2f} | <b>Avg/day:</b> ${avg_day:.2f}\n"
                 f"Reason: {reason}"
             )
+
             messages.append(msg)
 
     # 2) открыть новую, если есть сильный кандидат и нет открытой на ту же пару
@@ -1510,10 +1513,14 @@ def positions_open_close_loop(
                 msg = (
                     f"🚀 <b>Opened</b> {sym}\n"
                     f"LONG {long_ex.upper()} / SHORT {short_ex.upper()}\n"
-                    f"Combo APR: {apr_combo_pct:.2f}% | Size: ${per_leg_notional_usd:,.2f} per leg\n"
-                    f"Expected (next {int(best_row['exp_hours'])}h): "
-                    f"<b>${float(best_row['net_usd']):.2f}</b> after fees"
+                    f"Combo APR: {float(best_row['apr_combo'])*100:.2f}% | Size: ${per_leg_notional_usd:,.2f} per leg\n\n"
+                    f"<b>Profit/day (net):</b> ${float(best_row.get('net_day_usd', 0.0)):.2f}\n"
+                    f"  • Funding/day: ${float(best_row.get('funding_day_usd', 0.0)):.2f}\n"
+                    f"  • Fees/day: ${float(best_row.get('fees_day_usd', 0.0)):.2f}\n"
+                    f"<b>Expected ({int(best_row['exp_hours'])}h):</b> "
+                    f"${float(best_row.get('net_usd', 0.0)):.2f} after fees"
                 )
+
                 messages.append(msg)
 
     # сохранить позы
@@ -1573,15 +1580,20 @@ def build_cross_exchange_candidates(
                 apr_long_abs = abs(float(r_neg["apr"]))
                 apr_combo = apr_short + apr_long_abs  # комбинированный APR «получаем»
 
-                # комиссии (в USD) — 2 ордера на вход + 2 на выход
+                # комиссии (в USD) — 2 ордера на вход + 2 на выход (вход+выход обеих ног)
                 fee_short = _taker_fee_for(ex_short, default_fee)
                 fee_long  = _taker_fee_for(ex_long,  default_fee)
                 fees_usd  = per_leg_notional_usd * (2*fee_short + 2*fee_long)
 
-                # ожидаемый доход по фандингу за expected_h
+                # funding за весь горизонт expected_h
                 funding_usd = per_leg_notional_usd * apr_combo * hours_frac
-
                 net_usd = funding_usd - fees_usd
+
+                # агрегаты «в день» (унификация с Funding OPEN)
+                days = max(1e-9, expected_h / 24.0)
+                funding_day_usd = per_leg_notional_usd * (apr_combo / 365.0)
+                fees_day_usd = fees_usd / days
+                net_day_usd = funding_day_usd - fees_day_usd
 
                 rows.append({
                     "symbol": sym,
@@ -1589,12 +1601,17 @@ def build_cross_exchange_candidates(
                     "short_ex": ex_short,
                     "apr_long_abs": apr_long_abs,
                     "apr_short": apr_short,
-                    "apr_combo": apr_combo,        # %
+                    "apr_combo": apr_combo,           # доля, не %
                     "exp_hours": expected_h,
                     "funding_usd": round(funding_usd, 4),
                     "fees_usd": round(fees_usd, 4),
                     "net_usd": round(net_usd, 4),
+                    "funding_day_usd": round(funding_day_usd, 4),
+                    "fees_day_usd": round(fees_day_usd, 4),
+                    "net_day_usd": round(net_day_usd, 4),
                 })
+
+
 
     out = pd.DataFrame(rows)
     if not out.empty:
@@ -1690,14 +1707,22 @@ def main():
 
     # 3) выслать лучший сигнал в Telegram
     if best is not None:
+        days = max(1e-9, expected_h / 24.0)
+        expected_h = float(getenv_float("EXPECTED_HOLDING_H", 72))
+        expected_net = best['net_day_usd'] * (expected_h / 24.0)  # net_day_usd = твой уже посчитанный Profit/day (net)
         msg = (
-            f"📈 <b>Best cross-ex funding</b>\n"
-            f"{best['symbol']}: LONG {str(best['long_ex']).upper()} / SHORT {str(best['short_ex']).upper()}\n"
-            f"Combo APR: {float(best['apr_combo'])*100:.2f}%\n"
-            f"Expected {int(expected_h)}h: <b>${float(best['net_usd']):.2f}</b> "
+            "📈 <b>Best cross-ex funding</b>\n"
+            f"<b>{best['symbol']}</b>: LONG {str(best['long_ex']).upper()} / SHORT {str(best['short_ex']).upper()}\n"
+            f"Combo APR: {float(best['apr_combo'])*100:.2f}%\n\n"
+            f"<b>Profit/day (net):</b> ${float(best['net_day_usd']):.2f}\n"
+            f"  • Funding/day: ${float(best['funding_day_usd']):.2f}\n"
+            f"  • Fees/day: ${float(best['fees_day_usd']):.2f}\n"
+            f"Expected ({int(expected_h)}h): ${expected_net:.2f}\n"
+            f"<b>Expected ({int(expected_h)}h):</b> ${float(best['net_usd']):.2f} "
             f"(funding ${float(best['funding_usd']):.2f} − fees ${float(best['fees_usd']):.2f})"
         )
         maybe_send_telegram(msg)
+
 
     # 4) симуляция открытия/закрытия + Telegram апдейты
     pos_path = getenv_str("POSITIONS_CSV_PATH", "positions.csv")
