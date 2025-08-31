@@ -113,6 +113,8 @@ def getenv_list(key: str, default_list: List[str]) -> List[str]:
         return default_list
     return [x.strip() for x in v.split(",") if x.strip()]
 
+
+
 # ------------------------------
 # Requests session + logging
 # ------------------------------
@@ -239,7 +241,7 @@ def bybit_base() -> str:
     return "https://api-testnet.bybit.com" if getenv_bool("BYBIT_TESTNET", False) else "https://api.bybit.com"
 
 def binance_fapi_base() -> str:
-    return "https://testnet.binancefuture.com" if getenv_bool("BINANCE_FAPI_TESTNET", False) else "https://fapi.binance.com"
+    return "https://testnet.binancefuture.com" if getenv_bool("BINANCE_API_TESTNET", False) else "https://fapi.binance.com"
 
 def okx_base() -> str:
     return "https://www.okx.com"
@@ -295,6 +297,15 @@ def daily_borrow_cost_usd(notional: float, borrow_apr: float) -> float:
 
 def round2(x):
     return None if x is None else (round(float(x), 2))
+
+def verify_testnet_positions(symbol: str):
+    try:
+        b_positions = binance_futures_positions(symbol) or []
+        y_positions = bybit_positions(symbol) or {}
+        logging.info("BINANCE testnet positionRisk: %s", str(b_positions)[:300])
+        logging.info("BYBIT testnet positions: %s", str(y_positions)[:300])
+    except Exception as e:
+        logging.warning("Verify positions error: %s", e)
 
 def maybe_send_telegram(text: str) -> None:
     token = getenv_str("TELEGRAM_BOT_TOKEN", "")
@@ -1023,6 +1034,102 @@ def krakenf_funding(symbol: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+# ===== Testnet trading helpers (minimal) =====
+def _hmac_sha256(key: str, msg: str) -> str:
+    return hmac.new(key.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+def binance_signed(params: dict) -> dict:
+    api_key = os.getenv("BINANCE_API_KEY", "")
+    api_secret = os.getenv("BINANCE_API_SECRET", "")
+    params = {**params, "timestamp": int(time.time()*1000)}
+    qs = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
+    sig = _hmac_sha256(api_secret, qs)
+    headers = {"X-MBX-APIKEY": api_key}
+    return {"params": {**params, "signature": sig}, "headers": headers}
+
+def binance_futures_order(symbol: str, side: str, qty: float, reduce_only: bool=False):
+    url = f"{binance_fapi_base()}/fapi/v1/order"
+    data = {
+        "symbol": symbol.upper(),
+        "side": side.upper(),                     # BUY / SELL
+        "type": "MARKET",
+        "quantity": qty,
+        "reduceOnly": "true" if reduce_only else "false",
+        "recvWindow": 5000
+    }
+    signed = binance_signed(data)
+    r = SESSION.post(url, **signed, timeout=REQUEST_TIMEOUT)
+    if r.status_code != 200:
+        logging.warning("Binance order err %s %s", r.status_code, r.text[:200])
+    return r.json() if r.headers.get("Content-Type","").startswith("application/json") else None
+
+def binance_futures_positions(symbol: str):
+    signed = binance_signed({"symbol": symbol.upper(), "recvWindow": 5000})
+    r = SESSION.get(f"{binance_fapi_base()}/fapi/v2/positionRisk", **signed, timeout=REQUEST_TIMEOUT)
+    return r.json() if r.status_code == 200 else []
+
+def bybit_signed(params: dict) -> dict:
+    api_key = os.getenv("BYBIT_API_KEY", "")
+    api_secret = os.getenv("BYBIT_API_SECRET", "")
+    ts = str(int(time.time()*1000))
+    recv = "5000"
+    # v5 sign
+    param_str = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
+    sign_str = ts + api_key + recv + param_str
+    sig = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-SIGN": sig,
+        "X-BAPI-SIGN-TYPE": "2",
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "Content-Type": "application/json",
+    }
+    return {"headers": headers, "params": params}
+
+def bybit_place_order(symbol: str, side: str, qty: float, reduce_only: bool=False):
+    url = f"{bybit_base()}/v5/order/create"
+    params = {
+        "category": "linear",
+        "symbol": symbol.upper(),
+        "side": side.upper(),                 # Buy / Sell
+        "orderType": "Market",
+        "qty": str(qty),
+        "reduceOnly": reduce_only,
+        "timeInForce": "IOC"
+    }
+    signed = bybit_signed(params)
+    r = SESSION.post(url, headers=signed["headers"], json=params, timeout=REQUEST_TIMEOUT)
+    if r.status_code != 200:
+        logging.warning("Bybit order err %s %s", r.status_code, r.text[:200])
+    return r.json() if r.headers.get("Content-Type","").startswith("application/json") else None
+
+def bybit_positions(symbol: str):
+    params = {"category":"linear", "symbol": symbol.upper()}
+    signed = bybit_signed(params)
+    r = SESSION.get(f"{bybit_base()}/v5/position/list", headers=signed["headers"], params=params, timeout=REQUEST_TIMEOUT)
+    return r.json() if r.status_code == 200 else {}
+
+def _qty_from_notional(price: float, notional: float) -> float:
+    if not price or price <= 0: return 0.0
+    return round(float(notional)/float(price), 6)
+
+def execute_open_perp_pair(long_ex: str, short_ex: str, symbol: str, price: float, per_leg_notional_usd: float):
+    qty = _qty_from_notional(price, per_leg_notional_usd)
+    # LONG leg
+    if long_ex == "binance": binance_futures_order(symbol, "BUY", qty, reduce_only=False)
+    if long_ex == "bybit":   bybit_place_order(symbol, "Buy", qty, reduce_only=False)
+    # SHORT leg
+    if short_ex == "binance": binance_futures_order(symbol, "SELL", qty, reduce_only=False)
+    if short_ex == "bybit":   bybit_place_order(symbol, "Sell", qty, reduce_only=False)
+
+def execute_close_perp_pair(long_ex: str, short_ex: str, symbol: str, price: float, per_leg_notional_usd: float):
+    qty = _qty_from_notional(price, per_leg_notional_usd)
+    # закрываем встречными
+    if long_ex == "binance": binance_futures_order(symbol, "SELL", qty, reduce_only=True)
+    if long_ex == "bybit":   bybit_place_order(symbol, "Sell", qty, reduce_only=True)
+    if short_ex == "binance": binance_futures_order(symbol, "BUY", qty, reduce_only=True)
+    if short_ex == "bybit":   bybit_place_order(symbol, "Buy", qty, reduce_only=True)
 # ------------------------------
 # Binance Top symbols util
 # ------------------------------
@@ -1473,6 +1580,21 @@ def positions_open_close_loop(
             reason = f"MAX_HOLDING_H reached ({df_pos.at[i]['held_h']:.1f}h)"
 
         if do_close:
+            # реальное закрытие на тестнетах
+            if not paper:
+                # возьмём price из текущей карты APR (лучше подать mark price при вызове)
+                px_long  = None
+                px_short = None
+                try:
+                    # если есть «сырой» df_raw с ценами — выберем подходящее
+                    px_long  = float(df_raw[(df_raw["exchange"]==long_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
+                except Exception: pass
+                try:
+                    px_short = float(df_raw[(df_raw["exchange"]==short_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
+                except Exception: pass
+                px = px_long or px_short
+                execute_close_perp_pair(long_ex, short_ex, sym, px or 0.0, per_leg_notional_usd)
+
             # комиссии на выход
             fee_long  = _taker_fee_for(long_ex, default_fee)
             fee_short = _taker_fee_for(short_ex, default_fee)
@@ -1535,7 +1657,17 @@ def positions_open_close_loop(
                     "open_note": f"entry fees ${entry_fees:.2f}",
                     "held_h": 0.0,
                 }
+
                 df_pos = pd.concat([df_pos, pd.DataFrame([new])], ignore_index=True)
+                # реальное открытие на тестнетах
+                if not paper:
+                    px = float(best_row.get("entry_price") or 0.0)
+                    if px <= 0.0:
+                        try:
+                            px = float(df_raw[(df_raw["exchange"]==long_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
+                        except Exception:
+                            px = None
+                    execute_open_perp_pair(long_ex, short_ex, sym, px or 0.0, per_leg_notional_usd)
 
                 msg = (
                     f"🚀 <b>Opened</b> {sym}\n"
@@ -1749,10 +1881,11 @@ def main():
             f"(funding ${float(best['funding_usd']):.2f} − fees ${float(best['fees_usd']):.2f})"
         )
         maybe_send_telegram(msg)
-
+        verify_testnet_positions(best['symbol'])  # после открытия/закрытия
 
     # 4) симуляция открытия/закрытия + Telegram апдейты
     pos_path = getenv_str("POSITIONS_CSV_PATH", "positions.csv")
+    PAPER = getenv_bool("PAPER", True)
     events = positions_open_close_loop(
         df_raw=df,
         best_row=best,
@@ -1762,7 +1895,7 @@ def main():
         max_holding_h=max_hold,
         default_fee=default_fee,
         pos_path=pos_path,
-        paper=paper,
+        paper=PAPER,
     )
     for e in events:
         maybe_send_telegram(e)
@@ -1845,6 +1978,7 @@ def main():
                        f"APR: {cr['apr_pct']}% | 8h: {round((cr['rate_8h'] or 0)*100,6)}%\n"
                        f"Dir: {dir_}\nReason: {reason}")
                 maybe_send_telegram(msg)
+                verify_testnet_positions(sym)  # после открытия/закрытия
                 to_remove_idx.append(i)
 
         if to_remove_idx:
@@ -1878,6 +2012,7 @@ def main():
                     f"  • Borrow/day: ${round2(r['borrow_day_usd'])}\n"
                 )
                 maybe_send_telegram(card)
+                verify_testnet_positions(r['symbol'])  # после открытия/закрытия
 
         current_pos = positions.iloc[0] if len(positions) > 0 else None
         best = candidates.head(1)
@@ -1899,6 +2034,7 @@ def main():
                                      f"Open:  {ex.upper()} {sym}\n"
                                      f"Delta net/day: ${round2(delta_usd)}")
                         maybe_send_telegram(close_msg)
+                        verify_testnet_positions(sym)  # после открытия/закрытия
                         positions = positions.iloc[0:0]
                         need_open = True
                     else:
@@ -1923,6 +2059,7 @@ def main():
                     f"  • Borrow/day: ${round2(r['borrow_day_usd'])}\n"
                 )
                 maybe_send_telegram(card)
+                verify_testnet_positions(sym)  # после открытия/закрытия
 
                 new_pos = {
                     "exchange": ex, "symbol": sym, "direction": dir_,
