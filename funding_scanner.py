@@ -1486,15 +1486,20 @@ def positions_open_close_loop(
                 fee_short = _taker_fee_for(short_ex, default_fee)
                 entry_fees = per_leg_notional_usd * (fee_long + fee_short) * 2  # 2 ордера (вход 2 ног)
 
+                cur_max = None
+                if "id" in df_pos.columns:
+                    cur_max = pd.to_numeric(df_pos["id"], errors="coerce").max()
+                next_id = int(cur_max) + 1 if (cur_max is not None and pd.notna(cur_max)) else 1
+
                 new = {
-                    "id": int(df_pos["id"].max()+1) if "id" in df_pos.columns and not df_pos["id"].empty else 1,
+                    "id": next_id,
                     "symbol": sym,
                     "long_ex": long_ex,
                     "short_ex": short_ex,
                     "opened_ms": now_ms,
                     "last_ms": now_ms,
                     "size_usd": per_leg_notional_usd,
-                    "open_apr_combo": float(best_row["apr_combo"]),    # доля, не %
+                    "open_apr_combo": float(best_row["apr_combo"]),
                     "status": "open",
                     "accrued_usd": -entry_fees,
                     "open_note": f"entry fees ${entry_fees:.2f}",
