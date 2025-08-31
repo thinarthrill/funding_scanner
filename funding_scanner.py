@@ -503,6 +503,76 @@ def bybit_get_fee(symbol: str, default_fee: float = 0.0006) -> dict:
     maker, taker = fees
     return {"maker": float(maker), "taker": float(taker)}
 
+# ===== Binance time sync =====
+BINANCE_TIME_OFFSET_MS = 0
+_BINANCE_TIME_SYNCED_AT = 0
+
+def binance_sync_time():
+    """Раз в ~60с подтягиваем serverTime и считаем смещение."""
+    global BINANCE_TIME_OFFSET_MS, _BINANCE_TIME_SYNCED_AT
+    try:
+        r = SESSION.get(f"{binance_fapi_base()}/fapi/v1/time", timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            srv = int(r.json().get("serverTime"))
+            now = int(time.time() * 1000)
+            BINANCE_TIME_OFFSET_MS = srv - now
+            _BINANCE_TIME_SYNCED_AT = now
+            logging.debug("Binance time offset set to %+d ms", BINANCE_TIME_OFFSET_MS)
+    except Exception as e:
+        logging.debug("Binance time sync failed: %s", e)
+
+def _fmt_val(v):
+    # одинаковое форматирование чисел (без экспоненты и лишних нулей)
+    if isinstance(v, bool): return "true" if v else "false"
+    if isinstance(v, float):
+        s = ("%.10f" % v).rstrip("0").rstrip(".")
+        return s if s else "0"
+    return str(v)
+
+from urllib.parse import urlencode
+
+def binance_signed_get(params: dict) -> dict:
+    """GET с подписью: вернём headers и params (dict)."""
+    api_key   = os.getenv("BINANCE_API_KEY", "")
+    api_secret= os.getenv("BINANCE_API_SECRET", "")
+    now = int(time.time()*1000)
+    if now - (_BINANCE_TIME_SYNCED_AT or 0) > 60_000:
+        binance_sync_time()
+    base = dict(params)
+    base["timestamp"] = now + (BINANCE_TIME_OFFSET_MS or 0)
+    items = sorted((k, _fmt_val(v)) for k, v in base.items())
+    qs = urlencode(items, doseq=True)
+    sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    headers = {"X-MBX-APIKEY": api_key}
+    return {"headers": headers, "params": {**base, "signature": sig}}
+
+def binance_signed_post(params: dict) -> dict:
+    """POST с подписью: вернём headers и data=URLENCODED (строка), чтобы подписанное == отправленному."""
+    api_key   = os.getenv("BINANCE_API_KEY", "")
+    api_secret= os.getenv("BINANCE_API_SECRET", "")
+    now = int(time.time()*1000)
+    if now - (_BINANCE_TIME_SYNCED_AT or 0) > 60_000:
+        binance_sync_time()
+    base = dict(params)
+    base["timestamp"] = now + (BINANCE_TIME_OFFSET_MS or 0)
+    items = sorted((k, _fmt_val(v)) for k, v in base.items())
+    qs = urlencode(items, doseq=True)
+    sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    body = qs + "&signature=" + sig
+    headers = {"X-MBX-APIKEY": api_key, "Content-Type": "application/x-www-form-urlencoded"}
+    return {"headers": headers, "data": body}
+
+def binance_auth_healthcheck():
+    """Проверка ключей/подписи на /fapi/v2/balance (доступен и на тестнете)."""
+    try:
+        signed = binance_signed_get({"recvWindow": 5000})
+        r = SESSION.get(f"{binance_fapi_base()}/fapi/v2/balance",
+                        headers=signed["headers"], params=signed["params"], timeout=REQUEST_TIMEOUT)
+        logging.info("Binance auth check: %s %s", r.status_code, r.text[:120])
+    except Exception as e:
+        logging.warning("Binance auth healthcheck failed: %s", e)
+
+
 # Binance funding/mark
 def binance_premium_index(symbol: str) -> Optional[Dict[str, Any]]:
     try:
@@ -649,11 +719,11 @@ def mexc_funding(symbol: str) -> Optional[Dict[str, Any]]:
     base = "https://contract.mexc.com"
     sym_native = mexc_symbol(symbol)
     path = f"/api/v1/contract/funding_rate/{sym_native}"
-    t0 = time.time()
+    #t0 = time.time()
     try:
         r = MEXC_SESSION.get(base + path, timeout=getattr(MEXC_SESSION, "request_timeout", 6.0))
-        dt = (time.time() - t0) * 1000
-        logging.debug("MEXC HTTP %s %s -> %s in %.0fms", path, sym_native, r.status_code, dt)
+        #dt = (time.time() - t0) * 1000
+        #logging.debug("MEXC HTTP %s %s -> %s in %.0fms", path, sym_native, r.status_code, dt)
         if r.status_code == 429:
             time.sleep(1.5)
             r = MEXC_SESSION.get(base + path, timeout=getattr(MEXC_SESSION, "request_timeout", 6.0))
@@ -914,18 +984,19 @@ def binance_futures_order(symbol: str, side: str, qty: float, reduce_only: bool=
         "side": side.upper(),
         "type": "MARKET",
         "quantity": qty,
-        "reduceOnly": "true" if reduce_only else "false",
-        "recvWindow": 5000
+        "reduceOnly": True if reduce_only else False,  # булево ок
+        "recvWindow": 5000,
     }
-    signed = binance_signed(data)
-    r = SESSION.post(url, **signed, timeout=REQUEST_TIMEOUT)
+    signed = binance_signed_post(data)
+    r = SESSION.post(url, headers=signed["headers"], data=signed["data"], timeout=REQUEST_TIMEOUT)
     if r.status_code != 200:
         logging.warning("Binance order err %s %s", r.status_code, r.text[:200])
     return r.json() if r.headers.get("Content-Type","").startswith("application/json") else None
 
 def binance_futures_positions(symbol: str):
-    signed = binance_signed({"symbol": symbol.upper(), "recvWindow": 5000})
-    r = SESSION.get(f"{binance_fapi_base()}/fapi/v2/positionRisk", **signed, timeout=REQUEST_TIMEOUT)
+    signed = binance_signed_get({"symbol": symbol.upper(), "recvWindow": 5000})
+    r = SESSION.get(f"{binance_fapi_base()}/fapi/v2/positionRisk",
+                    headers=signed["headers"], params=signed["params"], timeout=REQUEST_TIMEOUT)
     return r.json() if r.status_code == 200 else []
 
 def bybit_signed(params: dict) -> dict:
@@ -1329,6 +1400,10 @@ def positions_open_close_loop(
 # Main
 # ------------------------------
 def main():
+    if not getenv_bool("PAPER", True) and "binance" in exchanges:
+        binance_sync_time()
+        binance_auth_healthcheck()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--noop", action="store_true")
     args = ap.parse_args()
