@@ -1400,15 +1400,17 @@ def positions_open_close_loop(
 # Main
 # ------------------------------
 def main():
-    if not getenv_bool("PAPER", True) and "binance" in exchanges:
-        binance_sync_time()
-        binance_auth_healthcheck()
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--noop", action="store_true")
     args = ap.parse_args()
 
     exchanges = [x.lower() for x in getenv_list("EXCHANGES", DEFAULT_EXCHANGES)]
+    
+    if not getenv_bool("PAPER", True) and "binance" in exchanges:
+        binance_sync_time()
+        binance_auth_healthcheck()
+
     top_n = int(getenv_float("TOP_N", 200))
     min_quote_usdt = float(getenv_float("MIN_QUOTE_USDT", 1_000_000))
 
