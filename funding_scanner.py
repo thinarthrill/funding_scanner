@@ -235,6 +235,15 @@ def bucketize_path(path: Optional[str]) -> Optional[str]:
 # ------------------------------
 # Generic utils
 # ------------------------------
+def bybit_base() -> str:
+    return "https://api-testnet.bybit.com" if getenv_bool("BYBIT_TESTNET", False) else "https://api.bybit.com"
+
+def binance_fapi_base() -> str:
+    return "https://testnet.binancefuture.com" if getenv_bool("BINANCE_FAPI_TESTNET", False) else "https://fapi.binance.com"
+
+def okx_base() -> str:
+    return "https://www.okx.com"
+
 def utc_ms_now() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -537,7 +546,7 @@ def bybit_get_fee(symbol: str) -> Optional[float]:
         api_secret = os.getenv("BYBIT_API_SECRET", "")
         if not api_key or not api_secret:
             return None
-        url = "https://api.bybit.com/v5/account/fee-rate"
+        url = f"{bybit_base()}/v5/market/instruments-info"
         params = {"category":"linear","symbol":symbol.upper()}
         ts = str(int(time.time()*1000))
         param_str = "&".join([f"{k}={v}" for k,v in sorted(params.items())])
@@ -561,7 +570,7 @@ def bybit_get_fee(symbol: str) -> Optional[float]:
 
 # Binance
 def binance_premium_index(symbol: str) -> Optional[Dict[str, Any]]:
-    url = "https://fapi.binance.com/fapi/v1/premiumIndex"
+    url = f"{binance_fapi_base()}/fapi/v1/exchangeInfo"
     try:
         r = SESSION.get(url, params={"symbol": symbol.upper()}, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
@@ -581,7 +590,7 @@ def binance_premium_index(symbol: str) -> Optional[Dict[str, Any]]:
 # Bybit
 def fetch_bybit_mark_price(symbol: str) -> Optional[float]:
     try:
-        r = SESSION.get("https://api.bybit.com/v5/market/tickers",
+        r = SESSION.get(f"{bybit_base()}/v5/market/instruments-info",
                         params={"category": "linear", "symbol": symbol.upper()},
                         timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
@@ -591,7 +600,7 @@ def fetch_bybit_mark_price(symbol: str) -> Optional[float]:
                 px = (to_float(rows[0].get("lastPrice")) or to_float(rows[0].get("markPrice")))
                 if px: return px
         # fallback
-        r2 = SESSION.get("https://api.bybit.com/v5/market/mark-price-kline",
+        r2 = SESSION.get(f"{bybit_base()}/v5/market/instruments-info",
                          params={"category":"linear","symbol":symbol.upper(),"interval":"1","limit":1},
                          timeout=REQUEST_TIMEOUT)
         if r2.status_code == 200:
@@ -605,7 +614,7 @@ def fetch_bybit_mark_price(symbol: str) -> Optional[float]:
 
 def bybit_latest_funding(symbol: str) -> Optional[Dict[str, Any]]:
     try:
-        r = SESSION.get("https://api.bybit.com/v5/market/funding/history",
+        r = SESSION.get(f"{bybit_base()}/v5/market/instruments-info",
                         params={"category":"linear","symbol":symbol.upper(),"limit":1},
                         timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
@@ -630,7 +639,10 @@ def okx_inst_id(symbol: str) -> str:
 
 def okx_mark_price(inst_id: str) -> Optional[float]:
     try:
-        r = SESSION.get("https://www.okx.com/api/v5/public/mark-price",
+        headers = {}
+        if getenv_bool("OKX_PAPER", False):
+            headers["x-simulated-trading"] = "1"
+        r = SESSION.get(f"{okx_base()}/api/v5/public/instruments",
                         params={"instType":"SWAP","instId":inst_id}, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             j = r.json()
@@ -644,7 +656,10 @@ def okx_mark_price(inst_id: str) -> Optional[float]:
 def okx_funding(symbol: str) -> Optional[Dict[str, Any]]:
     inst_id = okx_inst_id(symbol)
     try:
-        r = SESSION.get("https://www.okx.com/api/v5/public/funding-rate",
+        headers = {}
+        if getenv_bool("OKX_PAPER", False):
+            headers["x-simulated-trading"] = "1"
+        r = SESSION.get(f"{okx_base()}/api/v5/public/instruments",
                         params={"instId": inst_id}, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
             return None
@@ -1004,7 +1019,7 @@ def krakenf_funding(symbol: str) -> Optional[Dict[str, Any]]:
 # ------------------------------
 def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List[str]:
     try:
-        exinfo = SESSION.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT)
+        exinfo = SESSION.get(f"{binance_fapi_base()}/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT)
         exinfo.raise_for_status()
         info = exinfo.json()
         perp_usdt = {
@@ -1013,7 +1028,7 @@ def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List
             and s.get("quoteAsset") == "USDT"
             and s.get("status") == "TRADING"
         }
-        t24 = SESSION.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=REQUEST_TIMEOUT)
+        t24 = SESSION.get(f"{binance_fapi_base()}/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT)
         t24.raise_for_status()
         rows = t24.json()
         items = []
@@ -1160,7 +1175,7 @@ def _std_from_deribit(inst: str) -> Optional[str]:
     return None
 
 def list_binance_perp_usdt() -> Set[str]:
-    r = SESSION.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    r = SESSION.get(f"{binance_fapi_base()}/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT); r.raise_for_status()
     out=set()
     for s in r.json().get("symbols", []):
         if s.get("contractType")=="PERPETUAL" and s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING":
@@ -1168,7 +1183,7 @@ def list_binance_perp_usdt() -> Set[str]:
     return out
 
 def lister_bybit() -> Set[str]:
-    r = SESSION.get("https://api.bybit.com/v5/market/instruments-info", params={"category":"linear"}, timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    r = SESSION.get(f"{bybit_base()}/v5/market/instruments-info", params={"category":"linear"}, timeout=REQUEST_TIMEOUT); r.raise_for_status()
     out=set()
     for it in (r.json().get("result") or {}).get("list") or []:
         sym=(it.get("symbol") or "").upper()
@@ -1176,7 +1191,10 @@ def lister_bybit() -> Set[str]:
     return out
 
 def lister_okx() -> Set[str]:
-    r = SESSION.get("https://www.okx.com/api/v5/public/instruments", params={"instType":"SWAP"}, timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    headers = {}
+    if getenv_bool("OKX_PAPER", False):
+        headers["x-simulated-trading"] = "1"
+    r = SESSION.get(f"{okx_base()}/api/v5/public/instruments", params={"instType":"SWAP"}, timeout=REQUEST_TIMEOUT); r.raise_for_status()
     out=set()
     for it in (r.json().get("data") or []):
         std=_std_from_okx_inst(it.get("instId",""))
