@@ -1395,6 +1395,31 @@ def positions_open_close_loop(
 
     save_positions_df(pos_path, df_pos)
     return messages
+def binance_diag():
+    """
+    1) проверяем базовый домен (prod/testnet),
+    2) POST /fapi/v1/listenKey (APIKEY-only) — если тут -2015, проблема в ключе/IP,
+    3) GET /fapi/v2/balance (signed) — если тут -2015, обычно нет прав Futures.
+    """
+    base = binance_fapi_base()
+    logging.info("Binance base: %s (BINANCE_API_TESTNET=%s)", base, os.getenv("BINANCE_API_TESTNET", ""))
+    # 1) listenKey — подпись НЕ нужна, только X-MBX-APIKEY; отлавливает «неверный ключ/IP»
+    try:
+        r = SESSION.post(f"{base}/fapi/v1/listenKey",
+                         headers={"X-MBX-APIKEY": os.getenv("BINANCE_API_KEY","")},
+                         timeout=REQUEST_TIMEOUT)
+        logging.info("Binance listenKey: %s %s", r.status_code, r.text[:160])
+    except Exception as e:
+        logging.warning("Binance listenKey exception: %s", e)
+
+    # 2) balance — нужна подпись; отлавливает «нет прав Futures»
+    try:
+        signed = binance_signed_get({"recvWindow": 5000})
+        r = SESSION.get(f"{base}/fapi/v2/balance",
+                        headers=signed["headers"], params=signed["params"], timeout=REQUEST_TIMEOUT)
+        logging.info("Binance balance: %s %s", r.status_code, r.text[:160])
+    except Exception as e:
+        logging.warning("Binance balance exception: %s", e)
 
 # ------------------------------
 # Main
@@ -1406,8 +1431,9 @@ def main():
     args = ap.parse_args()
 
     exchanges = [x.lower() for x in getenv_list("EXCHANGES", DEFAULT_EXCHANGES)]
-    
+
     if not getenv_bool("PAPER", True) and "binance" in exchanges:
+        binance_diag()
         binance_sync_time()
         binance_auth_healthcheck()
 
