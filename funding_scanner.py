@@ -1283,7 +1283,11 @@ def positions_open_close_loop(
         short_ex = str(df_pos.at[i,"short_ex"])
         sym      = str(df_pos.at[i,"symbol"]).upper()
         last_ms  = int(df_pos.at[i,"last_ms"] or df_pos.at[i,"opened_ms"])
-        held_h   = float(df_pos.at[i].get("held_h", 0.0))
+        _held = df_pos.at[i, "held_h"] if "held_h" in df_pos.columns else 0.0
+        try:
+            held_h = 0.0 if _held is None or (isinstance(_held, float) and _held != _held) else float(_held)
+        except Exception:
+            held_h = 0.0
 
         apr_long  = apr_map.get((long_ex, sym), 0.0)
         apr_short = apr_map.get((short_ex, sym), 0.0)
@@ -1294,7 +1298,12 @@ def positions_open_close_loop(
 
         combo_frac = (dt_h / (24.0 * 365.0))
         delta_usd = per_leg_notional_usd * (apr_combo * combo_frac)
-        df_pos.at[i,"accrued_usd"] = float(df_pos.at[i].get("accrued_usd", 0.0)) + delta_usd
+        _acc = df_pos.at[i, "accrued_usd"] if "accrued_usd" in df_pos.columns else 0.0
+        try:
+            prev_acc = 0.0 if _acc is None or (isinstance(_acc, float) and _acc != _acc) else float(_acc)
+        except Exception:
+            prev_acc = 0.0
+        df_pos.at[i, "accrued_usd"] = prev_acc + delta_usd
         df_pos.at[i,"last_ms"] = now_ms
 
         do_close = False; reason = ""
