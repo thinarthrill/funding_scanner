@@ -103,6 +103,79 @@ try:
 except Exception:
     GCS_AVAILABLE = False
 
+# ------------------------------
+# Link builders (exchange → trading URL)
+# ------------------------------
+def _base_quote_from_symbol(symbol: str) -> tuple[str, str]:
+    s = (symbol or "").upper().replace("-", "")
+    if s.endswith("USDT"): return s[:-4], "USDT"
+    if s.endswith("USD"):  return s[:-3], "USD"
+    # fallback: пытаемся угадать по разделителю
+    if "_" in s:
+        b, q = s.split("_", 1)
+        return b, q
+    return s, "USDT"
+
+def exchange_trade_url(exchange: str, symbol: str, market: str = "perp") -> str:
+    """
+    market: "perp" | "spot"
+    Возвращает URL торгового экрана конкретной биржи для указанного инструмента.
+    """
+    ex = (exchange or "").strip().lower()
+    base, quote = _base_quote_from_symbol(symbol)
+    if market not in ("perp", "spot"):
+        market = "perp"
+
+    # Binance
+    if ex == "binance":
+        if market == "perp":
+            # пример: https://www.binance.com/en/futures/SOLUSDT?type=perpetual
+            return f"https://www.binance.com/en/futures/{base}{quote}?type=perpetual"
+        # spot
+        return f"https://www.binance.com/en/trade/{base}_{quote}?type=spot"
+
+    # Bybit
+    if ex == "bybit":
+        if market == "perp":
+            # пример: https://www.bybit.com/trade/usdt/SOLUSDT
+            return f"https://www.bybit.com/trade/usdt/{base}{quote}"
+        return f"https://www.bybit.com/trade/spot/{base}/{quote}"
+
+    # OKX
+    if ex == "okx":
+        if market == "perp":
+            # пример: https://www.okx.com/trade-swap/sol-usdt-swap
+            return f"https://www.okx.com/trade-swap/{base.lower()}-{quote.lower()}-swap"
+        return f"https://www.okx.com/trade-spot/{base.lower()}-{quote.lower()}"
+
+    # MEXC
+    if ex == "mexc":
+        if market == "perp":
+            # пример: https://www.mexc.com/futures/SOL_USDT
+            return f"https://www.mexc.com/futures/{base}_{quote}"
+        return f"https://www.mexc.com/exchange/{base}_{quote}"
+
+    # KuCoin Futures
+    if ex == "kucoin":
+        if market == "perp":
+            return f"https://www.kucoin.com/futures/{base}{quote}M"
+        return f"https://www.kucoin.com/trade/{base}-{quote}"
+
+    # Gate
+    if ex == "gate":
+        if market == "perp":
+            return f"https://www.gate.io/futures_trade/USDT/{base}_{quote}"
+        return f"https://www.gate.io/trade/{base}_{quote}"
+
+    # Bitget / Phemex / KrakenF — базовые шаблоны
+    if ex == "bitget":
+        return f"https://www.bitget.com/futures/usdt/{base}{quote}" if market == "perp" else f"https://www.bitget.com/spot/{base}{quote}"
+    if ex == "phemex":
+        return f"https://phemex.com/trade/{base}{quote}"
+    if ex == "krakenf":
+        return f"https://futures.kraken.com/markets/{base.lower()}-{quote.lower()}"
+    return ""
+
 def is_gs(path: Optional[str]) -> bool:
     return bool(path) and str(path).startswith("gs://")
 
@@ -1339,7 +1412,7 @@ def positions_open_close_loop(
             avg_day = (float(df_pos.at[i,"pnl_usd"]) / max(1e-9, held_h/24.0))
             msg = (
                 f"✅ <b>Closed</b> {sym}\n"
-                f"LONG {long_ex.upper()} / SHORT {short_ex.upper()}\n"
+                f"{_anchor_symbol(long_ex, sym, 'perp')} / {_anchor_symbol(short_ex, sym, 'perp')}\n"
                 f"Held: {held_h:.1f}h | APR_now: {apr_combo*100:.2f}%\n"
                 f"Accrued: ${float(df_pos.at[i,'accrued_usd']):.2f}\n"
                 f"Exit fees: ${exit_fees:.2f}\n"
@@ -1392,7 +1465,7 @@ def positions_open_close_loop(
 
                 msg = (
                     f"🚀 <b>Opened</b> {sym}\n"
-                    f"LONG {long_ex.upper()} / SHORT {short_ex.upper()}\n"
+                    f"{_anchor_symbol(long_ex, sym, 'perp')} / {_anchor_symbol(short_ex, sym, 'perp')}\n"
                     f"Combo APR: {float(best_row['apr_combo'])*100:.2f}% | Size: ${per_leg_notional_usd:,.2f} per leg\n\n"
                     f"<b>Profit/day (net):</b> ${float(best_row.get('net_day_usd', 0.0)):.2f}\n"
                     f"  • Funding/day: ${float(best_row.get('funding_day_usd', 0.0)):.2f}\n"
@@ -1404,6 +1477,12 @@ def positions_open_close_loop(
 
     save_positions_df(pos_path, df_pos)
     return messages
+
+def _anchor_symbol(exchange: str, symbol: str, market: str = "perp") -> str:
+    url = exchange_trade_url(exchange, symbol, market=market) or ""
+    label = f"{symbol}@{exchange.upper()}"
+    return f'<a href="{url}">{label}</a>' if url else label
+
 def binance_diag():
     """
     1) проверяем базовый домен (prod/testnet),
@@ -1527,13 +1606,20 @@ def main():
     # отправим карточку «лучший кросс» (информативно)
     if best is not None:
         expected_net = best['net_day_usd'] * (expected_h / 24.0)
+        long_ex  = str(best['long_ex'])
+        short_ex = str(best['short_ex'])
+        sym      = str(best['symbol']).upper()
+        long_a   = _anchor_symbol(long_ex,  sym, "perp")
+        short_a  = _anchor_symbol(short_ex, sym, "perp")
+        long_ex  = str(best['long_ex']); short_ex = str(best['short_ex']); sym = str(best['symbol']).upper()
+        long_a   = _anchor_symbol(long_ex,  sym, "perp")
+        short_a  = _anchor_symbol(short_ex, sym, "perp")
         msg = (
             "📈 <b>Best cross-ex funding</b>\n"
-            f"<b>{best['symbol']}</b>: LONG {str(best['long_ex']).upper()} / SHORT {str(best['short_ex']).upper()}\n"
+            f"{long_a} / {short_a}\n"
             f"Combo APR: {float(best['apr_combo'])*100:.2f}%\n\n"
             f"<b>Profit/day (net):</b> ${float(best['net_day_usd']):.2f}\n"
-            f"  • Funding/day: ${float(best['funding_day_usd']):.2f}\n"
-            f"  • Fees/day: ${float(best['fees_day_usd']):.2f}\n"
+            f"  • Funding/day: ${float(best['funding_day_usd']):.2f}\n  • Fees/day: ${float(best['fees_day_usd']):.2f}\n"
             f"Expected ({int(expected_h)}h): ${expected_net:.2f}\n"
             f"<b>Expected ({int(expected_h)}h):</b> ${float(best['net_usd']):.2f} "
             f"(funding ${float(best['funding_usd']):.2f} − fees ${float(best['fees_usd']):.2f})"
@@ -1648,9 +1734,11 @@ def main():
                     continue
                 qty = hedge_qty(eff_notional, r["price"])
                 nf = r.get("next_funding_utc") or "n/a"
+                perp_a = _anchor_symbol(str(r["exchange"]), str(r["symbol"]).upper(), "perp")
+                spot_a = _anchor_symbol(str(r["exchange"]), str(r["symbol"]).upper(), "spot")
                 card = (
                     "🚀 <b>Funding OPEN</b>\n"
-                    f"<b>{r['exchange'].upper()} {r['symbol']}</b>\n"
+                    f"{perp_a}  |  spot: {spot_a}\n"
                     f"<code>APR: {r['apr_pct']}% | 8h: {round((r['rate_8h'] or 0)*100,6)}%</code>\n"
                     f"Dir: <b>{'Short perp & Long spot' if r['direction']=='SHORT_PERP_LONG_SPOT' else 'Long perp & Short spot'}</b>\n"
                     f"Price: {r['price']} | Qty(est): {qty}\n"
