@@ -1613,9 +1613,22 @@ def positions_open_close_loop(
             "size_usd","open_apr_combo","status","accrued_usd","open_note","held_h"
         ])
 
-    apr_map = {}
-    for _, r in df_raw[["exchange","symbol","apr"]].dropna().iterrows():
-        apr_map[(str(r["exchange"]).lower(), str(r["symbol"]).upper())] = float(r["apr"])
+    # Построим карту APR только если есть нужные колонки
+    apr_map: dict[tuple[str, str], float] = {}
+    have_rates = False
+    try:
+        if (df_raw is not None 
+            and hasattr(df_raw, "columns") 
+            and all(c in df_raw.columns for c in ("exchange","symbol","apr"))
+            and not df_raw.empty):
+            sub = df_raw.loc[:, ["exchange","symbol","apr"]].dropna(subset=["exchange","symbol","apr"])
+            for _, r in sub.iterrows():
+                apr_map[(str(r["exchange"]).lower(), str(r["symbol"]).upper())] = float(r["apr"])
+            have_rates = len(apr_map) > 0
+        else:
+            logging.info("positions_open_close_loop: no fresh rates (df_raw empty or missing columns)")
+    except Exception as e:
+        logging.warning("positions_open_close_loop: APR map build failed: %s", e)
 
     # обновление открытых
     for i in range(len(df_pos)):
@@ -1649,7 +1662,9 @@ def positions_open_close_loop(
         df_pos.at[i,"last_ms"] = now_ms
 
         do_close = False; reason = ""
-        if apr_combo*100.0 < float(exit_apr_threshold):
+        do_close = False; reason = ""
+        # Закрываем по APR только если у нас есть свежие ставки
+        if have_rates and (apr_combo*100.0 < float(exit_apr_threshold)):
             do_close = True; reason = f"APR fell below EXIT ({apr_combo*100:.2f}% < {exit_apr_threshold:.2f}%)"
         if df_pos.at[i,"held_h"] >= float(max_holding_h):
             do_close = True; reason = f"MAX_HOLDING_H reached ({df_pos.at[i]['held_h']:.1f}h)"
@@ -1871,6 +1886,10 @@ def main():
         default_fee=default_fee,
     )
     best = cands.iloc[0] if not cands.empty else None
+
+    if df.empty:
+        logging.info("Scan returned no rows — skipping positions loop this tick.")
+        return
 
     # отправим карточку «лучший кросс» (информативно)
     if best is not None:
