@@ -75,6 +75,18 @@ import requests
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
 
+# ===== Funding “next” control =====
+# Требуем прогноз следующего фандинга (8h). Если нет — не торгуем.
+FUNDING_REQUIRE_NEXT = os.getenv("FUNDING_REQUIRE_NEXT", "1") in ("1","true","True","yes","Y")
+# Показывать в Telegram last для справки (рядом с next)
+FUNDING_SHOW_LAST    = os.getenv("FUNDING_SHOW_LAST", "0") in ("1","true","True","yes","Y")
+
+# Биржи, где пробуем тянуть next из публичных API
+NEXT_SUPPORTED_EXCH = {
+    "okx", "bybit", "mexc", "kucoin", "deribit",
+    "bitget", "gate", "phemex", "krakenf", "binance"  # binance → None (отсев)
+}
+
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 _retry = Retry(
@@ -91,6 +103,231 @@ SESSION.mount("http://", _adapter)
 for noisy in ("urllib3", "requests.packages.urllib3", "google"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.getLogger(noisy).propagate = False
+
+# ------------------------------
+# Helpers for symbols
+# ------------------------------
+def _base_quote_from_symbol(symbol: str) -> tuple[str, str]:
+    s = (symbol or "").upper().replace("-", "")
+    if s.endswith("USDT"): return s[:-4], "USDT"
+    if s.endswith("USD"):  return s[:-3], "USD"
+    if "_" in s:
+        b, q = s.split("_", 1)
+        return b, q
+    return s, "USDT"
+
+# ------------------------------
+# Next funding fetchers per exchange
+# Возвращают (rate_next_8h, nextFundingTime_ms, rate_last_8h)
+# Если биржа не даёт next публично — вернуть (None, None, last_or_None)
+# ------------------------------
+def _okx_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
+    try:
+        base, quote = _base_quote_from_symbol(symbol)
+        inst = f"{base}-{quote}-SWAP"
+        r = _retry_get("https://www.okx.com/api/v5/public/funding-rate", {"instId": inst})
+        data = (r or {}).get("data") or []
+        if not data: return None, None, None
+        d = data[0]
+        nxt = d.get("nextFundingRate")
+        cur = d.get("fundingRate")
+        tms = d.get("fundingTime")
+        rate_next = float(nxt) if nxt not in (None, "") else None
+        rate_last = float(cur) if cur not in (None, "") else None
+        next_ms   = int(tms) if tms else None
+        return rate_next, next_ms, rate_last
+    except Exception:
+        return None, None, None
+
+def _bybit_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
+    # v5
+    try:
+        r = _retry_get("https://api.bybit.com/v5/market/tickers",
+                       {"category": "linear", "symbol": symbol.upper()})
+        lst = ((r or {}).get("result") or {}).get("list") or []
+        if lst:
+            d = lst[0]
+            nxt = d.get("predictedFundingRate") or d.get("predicted_funding_rate")
+            last= d.get("fundingRate") or d.get("funding_rate")
+            tms = d.get("nextFundingTime") or d.get("next_funding_time")
+            rate_next = float(nxt) if nxt not in (None, "") else None
+            rate_last = float(last) if last not in (None, "") else None
+            next_ms   = int(tms) if tms else None
+            return rate_next, next_ms, rate_last
+    except Exception:
+        pass
+    # v2 fallback
+    try:
+        r2 = _retry_get("https://api.bybit.com/v2/public/tickers", {"symbol": symbol.upper()})
+        res = (r2 or {}).get("result") or []
+        if res:
+            d = res[0]
+            nxt = d.get("predicted_funding_rate")
+            last= d.get("funding_rate")
+            tms = d.get("next_funding_time")
+            rate_next = float(nxt) if nxt not in (None, "") else None
+            rate_last = float(last) if last not in (None, "") else None
+            next_ms   = int(tms) if tms else None
+            return rate_next, next_ms, rate_last
+    except Exception:
+        pass
+    return None, None, None
+
+def _mexc_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
+    base, quote = _base_quote_from_symbol(symbol)
+    sym_u = f"{base}_{quote}"
+    # 1) contract fundingRate
+    try:
+        r1 = _retry_get("https://contract.mexc.com/api/v1/contract/fundingRate", {"symbol": sym_u})
+        d = (r1 or {}).get("data") or {}
+        nxt = d.get("nextFundingRate") or d.get("predictedFundingRate") or d.get("predicted_funding_rate")
+        last= d.get("fundingRate") or d.get("funding_rate")
+        tms = d.get("nextFundingTime") or d.get("next_funding_time")
+        rate_next = float(nxt) if nxt not in (None, "") else None
+        rate_last = float(last) if last not in (None, "") else None
+        next_ms   = int(tms) if tms else None
+        if rate_next is not None:
+            return rate_next, next_ms, rate_last
+    except Exception:
+        pass
+    # 2) premiumIndex
+    try:
+        r2 = _retry_get("https://contract.mexc.com/api/v1/contract/premiumIndex", {"symbol": sym_u})
+        d = (r2 or {}).get("data") or {}
+        nxt = d.get("predictedFundingRate") or d.get("predicted_funding_rate")
+        tms = d.get("nextFundingTime") or d.get("next_funding_time")
+        rate_next = float(nxt) if nxt not in (None, "") else None
+        next_ms   = int(tms) if tms else None
+        return rate_next, next_ms, None
+    except Exception:
+        pass
+    return None, None, None
+
+def _kucoin_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
+    # KuCoin Futures: активные контракты содержат predictedFundingFeeRate/nextFundingTime
+    try:
+        r = _retry_get("https://api-futures.kucoin.com/api/v1/contracts/active", {})
+        items = (r or {}).get("data") or []
+        if not items: return None, None, None
+        for it in items:
+            # символы формата BTCUSDTM
+            if (it.get("symbol") or "").upper() == (symbol or "").upper() + "M":
+                nxt = it.get("predictedFundingFeeRate")
+                last= it.get("fundingFeeRate")
+                tms = it.get("nextFundingTime")
+                rate_next = float(nxt) if nxt not in (None, "") else None
+                rate_last = float(last) if last not in (None, "") else None
+                next_ms   = int(tms) if tms else None
+                return rate_next, next_ms, rate_last
+    except Exception:
+        pass
+    return None, None, None
+
+def _deribit_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
+    # Deribit perpetuals: public/ticker → fields funding_8h (indicative), funding_8h_next (в ряде релизов)
+    # используем funding_8h как next-estimate
+    try:
+        base, quote = _base_quote_from_symbol(symbol)
+        inst = f"{base.upper()}-PERPETUAL"
+        r = _retry_get("https://www.deribit.com/api/v2/public/ticker", {"instrument_name": inst})
+        d = (r or {}).get("result") or {}
+        nxt = d.get("funding_8h") or d.get("estimated_funding_8h")
+        # Deribit отдаёт utcTimestamp — используем как nextFundingTime эвристически
+        tms = d.get("timestamp")
+        rate_next = float(nxt) if nxt not in (None, "") else None
+        next_ms   = int(tms) if tms else None
+        return rate_next, next_ms, None
+    except Exception:
+        return None, None, None
+
+def _bitget_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
+    # Bitget UM-perp: /api/mix/v1/market/tickers?productType=umcbl → fundingRate (indicative) и nextFundingTime
+    try:
+        r = _retry_get("https://api.bitget.com/api/mix/v1/market/tickers", {"productType": "umcbl"})
+        lst = (r or {}).get("data") or []
+        sym_um = f"{symbol.upper()}_UMCBL"
+        for it in lst:
+            if (it.get("symbol") or "").upper() == sym_um:
+                nxt = it.get("fundingRate") or it.get("predictedFundingRate")
+                tms = it.get("nextFundingTime")
+                rate_next = float(nxt) if nxt not in (None, "") else None
+                next_ms   = int(tms) if tms else None
+                return rate_next, next_ms, None
+    except Exception:
+        pass
+    return None, None, None
+
+def _gate_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
+    # Gate USDT-perp: /api/v4/futures/usdt/contracts/{base_usdt} → funding_rate_indicative, funding_next_apply
+    try:
+        base, quote = _base_quote_from_symbol(symbol)
+        contract = f"{base.upper()}_{quote.upper()}"
+        r = _retry_get(f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{contract}", {})
+        nxt = (r or {}).get("funding_rate_indicative")
+        last= (r or {}).get("funding_rate")
+        tms = (r or {}).get("funding_next_apply")
+        rate_next = float(nxt) if nxt not in (None, "") else None
+        rate_last = float(last) if last not in (None, "") else None
+        next_ms   = int(tms) if isinstance(tms, (int, float)) else None
+        return rate_next, next_ms, rate_last
+    except Exception:
+        return None, None, None
+
+def _phemex_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
+    # Phemex: /md/ticker/24hr?symbol=BTCUSDT → predFundingRateR, fundingRateR, nextFundingTime
+    try:
+        r = _retry_get("https://api.phemex.com/md/ticker/24hr", {"symbol": symbol.upper()})
+        d = (r or {}).get("data") or {}
+        nxt = d.get("predFundingRateR") or d.get("predFundingRate")
+        last= d.get("fundingRateR") or d.get("fundingRate")
+        tms = d.get("nextFundingTime")
+        rate_next = float(nxt) if nxt not in (None, "") else None
+        rate_last = float(last) if last not in (None, "") else None
+        next_ms   = int(tms) if tms else None
+        return rate_next, next_ms, rate_last
+    except Exception:
+        return None, None, None
+
+def _krakenf_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
+    # Kraken Futures: /derivatives/api/v3/instruments → indicativeFundingRate, funding_next_apply
+    try:
+        r = _retry_get("https://futures.kraken.com/derivatives/api/v3/instruments", {})
+        instruments = ((r or {}).get("instruments")) or []
+        # символы формата "pf_{base}usd" → сопоставим по base
+        base, quote = _base_quote_from_symbol(symbol)
+        target1 = f"pf_{base.lower()}usd"
+        target2 = f"pf_{base.lower()}usdt"
+        for it in instruments:
+            sym = (it.get("symbol") or "").lower()
+            if sym in (target1, target2):
+                nxt = it.get("indicativeFundingRate")
+                last= it.get("fundingRate")
+                tms = it.get("funding_next_apply")
+                rate_next = float(nxt) if nxt not in (None, "") else None
+                rate_last = float(last) if last not in (None, "") else None
+                next_ms   = int(tms) if tms else None
+                return rate_next, next_ms, rate_last
+    except Exception:
+        pass
+    return None, None, None
+
+def _binance_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
+    # Binance публично next не отдаёт → возвращаем None, чтобы инструмент отфильтровался.
+    return None, None, None
+
+def get_next_funding(exchange: str, symbol: str) -> tuple[float|None, int|None, float|None]:
+    ex = (exchange or "").lower()
+    if   ex == "okx":     return _okx_next_rate(symbol)
+    elif ex == "bybit":   return _bybit_next_rate(symbol)
+    elif ex == "mexc":    return _mexc_next_rate(symbol)
+    elif ex == "kucoin":  return _kucoin_next_rate(symbol)
+    elif ex == "deribit": return _deribit_next_rate(symbol)
+    elif ex == "bitget":  return _bitget_next_rate(symbol)
+    elif ex == "gate":    return _gate_next_rate(symbol)
+    elif ex == "phemex":  return _phemex_next_rate(symbol)
+    elif ex == "krakenf": return _krakenf_next_rate(symbol)
+    elif ex == "binance": return _binance_next_rate(symbol)
+    return None, None, None
 
 # ------------------------------
 # GCS helpers + BACKET support
@@ -219,6 +456,11 @@ def gcs_read_csv(gs_path: str, expected_columns: List[str]):
         logging.warning("GCS read error %s: %s", gs_path, e)
         import pandas as pd
         return pd.DataFrame(columns=expected_columns)
+    
+def fmt_price(p):
+    if p is None: return "n/a"
+    s = f"{float(p):.8f}".rstrip("0").rstrip(".")
+    return s
 
 def gcs_write_csv(gs_path: str, df):
     try:
@@ -1253,6 +1495,33 @@ def scan_all(exchanges: List[str], symbols: List[str], symbols_by_ex: Optional[D
             row["time_utc"] = fmt_ts(row.get("ts"))
             row["next_funding_utc"] = fmt_ts(row.get("next_funding_time"))
             row["direction"] = suggestion_from_rate(r8)
+
+            # --- заменить/добавить перед rows.append(row) ---
+            rate_next, next_ms, rate_last = get_next_funding(ex, sym)
+
+            # Если требуем next и биржа его не даёт — пропускаем инструмент
+            if FUNDING_REQUIRE_NEXT and rate_next is None:
+                continue
+
+            # Сохраняем last для справки
+            row["rate_8h_last"] = rate_last if rate_last is not None else row.get("rate_8h")
+
+            # Если есть next — используем его как рабочий rate
+            if rate_next is not None:
+                row["rate_8h_next"] = rate_next
+                row["rate_8h"] = rate_next   # дальше вся логика (APR, net/day) будет по next
+            else:
+                row["rate_8h_next"] = None   # останется last (если FUNDING_REQUIRE_NEXT=0)
+            r8_eff = row.get("rate_8h")
+            apr_eff = annualize_from_8h(r8_eff) if r8_eff is not None else None
+            row["apr"] = apr_eff
+            row["apr_pct"] = round(apr_eff*100, 4) if apr_eff is not None else None
+            row["rate_8h_pct"] = round((r8_eff or 0)*100, 6)
+            # Таймстемп следующего фандинга (если дали) — для Телеграма
+            if next_ms:
+                row["next_funding_time"] = next_ms
+                row["next_funding_utc"] = datetime.utcfromtimestamp(next_ms/1000).strftime("%Y-%m-%d %H:%M:%S UTC")
+
             rows.append(row)
     return pd.DataFrame(rows)
 
@@ -1736,17 +2005,20 @@ def main():
                 nf = r.get("next_funding_utc") or "n/a"
                 perp_a = _anchor_symbol(str(r["exchange"]), str(r["symbol"]).upper(), "perp")
                 spot_a = _anchor_symbol(str(r["exchange"]), str(r["symbol"]).upper(), "spot")
+                hdr = f"APR(next): {r['apr_pct']}% | 8h(next): {round(((r.get('rate_8h_next') if r.get('rate_8h_next') is not None else r.get('rate_8h')) or 0)*100, 6)}%"
+                if FUNDING_SHOW_LAST and r.get("rate_8h_last") is not None:
+                    hdr += f" · last: {round(float(r['rate_8h_last'])*100, 6)}%"
                 card = (
                     "🚀 <b>Funding OPEN</b>\n"
                     f"{perp_a}  |  spot: {spot_a}\n"
-                    f"<code>APR: {r['apr_pct']}% | 8h: {round((r['rate_8h'] or 0)*100,6)}%</code>\n"
-                    f"Dir: <b>{'Short perp & Long spot' if r['direction']=='SHORT_PERP_LONG_SPOT' else 'Long perp & Short spot'}</b>\n"
-                    f"Price: {r['price']} | Qty(est): {qty}\n"
+                    f"<code>{hdr}</code>\n"
+                    f"Dir: <b>Short perp & Long spot</b>\n"
+                    f"Price: {fmt_price(r.get('price'))} | Qty(est): {qty}\n"
                     f"Next funding: {nf}\n\n"
-                    f"<b>Profit/day (net): ${round2(r['net_day_usd'])}</b>\n"
-                    f"  • Funding/day (gross): ${round2(r['gross_day_usd'])}\n"
-                    f"  • Fees/day (amort): ${round2(r['fees_day_usd'])}\n"
-                    f"  • Borrow/day: ${round2(r['borrow_day_usd'])}\n"
+                    f"<b>Profit/day (net):</b> ${float(r['net_day_usd']):.2f}\n"
+                    f" • Funding/day (gross): ${float(r['gross_day_usd']):.2f}\n"
+                    f" • Fees/day (amort): ${float(r['fees_day_usd']):.2f}\n"
+                    f" • Borrow/day: ${float(r['borrow_day_usd']):.2f}"
                 )
                 maybe_send_telegram(card)
 
