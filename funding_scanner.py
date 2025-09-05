@@ -105,6 +105,36 @@ for noisy in ("urllib3", "requests.packages.urllib3", "google"):
     logging.getLogger(noisy).propagate = False
 
 # ------------------------------
+# HTTP helper with retries + debug
+# ------------------------------
+REQUEST_TIMEOUT = 8  # секунд
+
+def _retry_get(url: str, params: dict | None = None) -> dict | None:
+    """
+    Обёртка над SESSION.get с ретраями (см. HTTPAdapter выше).
+    Возвращает JSON (dict) либо None при ошибке. Пишет подробный DEBUG-лог.
+    """
+    try:
+        resp = SESSION.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
+        code = resp.status_code
+        # логируем короткую сводку (URL + статус + первые символы тела)
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            body_preview = (resp.text or "")[:200].replace("\n", " ")
+            logging.debug("HTTP %s %s -> %s | %s",
+                          "GET", resp.url, code, body_preview)
+
+        if code != 200:
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            return None
+    except Exception as e:
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("HTTP GET failed %s params=%s err=%s", url, params, repr(e))
+        return None
+
+# ------------------------------
 # Helpers for symbols
 # ------------------------------
 def _base_quote_from_symbol(symbol: str) -> tuple[str, str]:
@@ -1491,7 +1521,7 @@ def scan_all(exchanges: List[str], symbols: List[str], symbols_by_ex: Optional[D
                     "Scanned %s %s | next=%s | next_t=%s | last=%s",
                     ex, sym, rn, ts_next, rl
                 )
-                
+
             if not row:
                 continue
             r8 = row.get("rate_8h")
