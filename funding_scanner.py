@@ -1483,8 +1483,15 @@ def scan_all(exchanges: List[str], symbols: List[str], symbols_by_ex: Optional[D
                 row = krakenf_funding(sym)
 
             if logging.getLogger().isEnabledFor(logging.DEBUG):
-                logging.debug("Scanned %s %s", ex, sym)
-
+                rate_next, next_ms, rate_last = get_next_funding(ex, sym)
+                ts_next = fmt_ts(next_ms) if next_ms else "n/a"
+                rn = f"{rate_next:.6f}" if rate_next is not None else "n/a"
+                rl = f"{rate_last:.6f}" if rate_last is not None else "n/a"
+                logging.debug(
+                    "Scanned %s %s | next=%s | next_t=%s | last=%s",
+                    ex, sym, rn, ts_next, rl
+                )
+                
             if not row:
                 continue
             r8 = row.get("rate_8h")
