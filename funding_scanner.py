@@ -201,6 +201,32 @@ def _okx_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
     except Exception:
         return None, None, None
 
+def _bybit_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
+    """
+    Bybit: пробуем вытащить predictedFundingRate из /v5/market/tickers.
+    Возвращаем (predictedFundingRate, nextFundingTime, fundingRate_last).
+    Если биржа не отдаёт прогноз, вернём (None, nextFundingTime, fundingRate_last).
+    """
+    try:
+        r = SESSION.get(
+            f"{bybit_base()}/v5/market/tickers",
+            params={"category": "linear", "symbol": (symbol or "").upper()},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return None, None, None
+        j = r.json() or {}
+        lst = ((j.get("result") or {}).get("list")) or []
+        if not lst:
+            return None, None, None
+        d = lst[0] if isinstance(lst[0], dict) else {}
+        rate_pred = to_float(d.get("predictedFundingRate"))
+        rate_last = to_float(d.get("fundingRate"))
+        next_ms   = int(d.get("nextFundingTime")) if d.get("nextFundingTime") else None
+        return rate_pred, next_ms, rate_last
+    except Exception:
+        return None, None, None
+
 def _bybit_ws_url() -> str:
     return "wss://stream-testnet.bybit.com/v5/public/linear" if getenv_bool("BYBIT_TESTNET", False) \
            else "wss://stream.bybit.com/v5/public/linear"
