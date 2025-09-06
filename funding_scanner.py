@@ -32,6 +32,22 @@ from dotenv import load_dotenv
 
 load_dotenv()  # подгрузить .env
 
+import certifi
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+
+# Bybit SDK (как на твоих скринах)
+try:
+    from bybit import Client as BybitClient, WebSocket as BybitWS
+except Exception:
+    BybitClient, BybitWS = None, None
+
+# Фолбэк на сырой сокет (если BybitWS недоступен)
+import websocket
+import threading
+
+BYBIT_FUNDING_CACHE: dict[str, tuple[float|None, int|None, float|None]] = {}
+_BYBIT_WS_STARTED = False
+
 # ------------------------------
 # ENV helpers
 # ------------------------------
@@ -168,40 +184,103 @@ def _okx_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
         return rate_next, next_ms, rate_last
     except Exception:
         return None, None, None
+def _bybit_ws_url() -> str:
+    return "wss://stream-testnet.bybit.com/v5/public/linear" if getenv_bool("BYBIT_TESTNET", False) \
+           else "wss://stream.bybit.com/v5/public/linear"
+
+def _start_bybit_ws_once():
+    """Запустить Bybit public WS (tickers.*) один раз и наполнять кеш BYBIT_FUNDING_CACHE."""
+    global _BYBIT_WS_STARTED
+    if _BYBIT_WS_STARTED:
+        return
+    _BYBIT_WS_STARTED = True
+
+    def _on_msg(payload: dict):
+        try:
+            # ожидание формата v5: topic='tickers', data=[{...}]
+            if not isinstance(payload, dict) or payload.get("topic") != "tickers":
+                return
+            rows = payload.get("data") or []
+            if isinstance(rows, dict):
+                rows = [rows]
+            for d in rows:
+                if not isinstance(d, dict): 
+                    continue
+                sym = (d.get("symbol") or "").upper()
+                if not sym:
+                    continue
+                nxt  = d.get("predictedFundingRate") or d.get("predicted_funding_rate")
+                last = d.get("fundingRate")          or d.get("funding_rate")
+                tms  = d.get("nextFundingTime")      or d.get("next_funding_time")
+                BYBIT_FUNDING_CACHE[sym] = (
+                    (float(nxt)  if nxt  not in (None, "", "null") else None),
+                    (int(tms)    if tms  else None),
+                    (float(last) if last not in (None, "", "null") else None),
+                )
+        except Exception as e:
+            # без трейсбэка, чтобы не заспамить Render
+            logging.debug("Bybit WS parse err: %s", e)
+
+    # --- Вариант 1: официальный SDK как в твоих скринах ---
+    if BybitWS is not None:
+        try:
+            # client можно держать, если где-то нужен REST; для WS он не обязателен
+            _ = BybitClient(api_key=getenv_str("BYBIT_API_KEY",""), api_secret=getenv_str("BYBIT_API_SECRET",""), test=getenv_bool("BYBIT_TESTNET", False))
+        except Exception:
+            pass
+        def _sdk_cb(msg):
+            # SDK отдаёт dict; пробрасываем в общий обработчик
+            _on_msg(msg)
+        ws = BybitWS(test=getenv_bool("BYBIT_TESTNET", False), ping_interval=30, ping_timeout=10)
+        # Подписка на все тики USDT-перпов: instrument_info.linear в старом SDK часто несёт funding поля
+        # но в v5 корректнее topic='tickers'; многие сборки SDK уже мапят его через .ticker()/.ticker_stream()
+        try:
+            ws.ticker_stream(callback=_sdk_cb)  # если метод есть в твоей версии SDK
+            logging.info("Bybit WS (SDK) subscribed: tickers.*")
+            return
+        except Exception:
+            # fallback на старый канал instrument_info
+            try:
+                ws.instrument_info("linear", _sdk_cb)
+                logging.info("Bybit WS (SDK) subscribed: instrument_info.linear")
+                return
+            except Exception as e:
+                logging.warning("Bybit SDK WS failed, fallback to raw ws: %s", e)
+
+    # --- Вариант 2: сырой сокет (если SDK WS недоступен) ---
+    def _on_open(ws):
+        sub = {"op":"subscribe","args":["tickers.*"]}  # все USDT-перпы
+        ws.send(json.dumps(sub))
+        logging.info("Bybit WS (raw) subscribed: tickers.*")
+
+    def _on_message(ws, message: str):
+        try:
+            payload = json.loads(message)
+        except Exception:
+            return
+        _on_msg(payload)
+
+    def _loop():
+        url = _bybit_ws_url()
+        while True:
+            try:
+                websocket.WebSocketApp(
+                    url,
+                    on_open=_on_open,
+                    on_message=_on_message,
+                    on_error=lambda ws, err: logging.warning("Bybit WS error: %s", err),
+                    on_close=lambda ws, code, msg: logging.info("Bybit WS closed: %s %s", code, msg),
+                ).run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as e:
+                logging.warning("Bybit WS reconnect in 5s: %s", e)
+                time.sleep(5)
+
+    threading.Thread(target=_loop, daemon=True).start()
 
 def _bybit_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
-    # v5
-    try:
-        r = _retry_get("https://api.bybit.com/v5/market/tickers",
-                       {"category": "linear", "symbol": symbol.upper()})
-        lst = ((r or {}).get("result") or {}).get("list") or []
-        if lst:
-            d = lst[0]
-            nxt = d.get("predictedFundingRate") or d.get("predicted_funding_rate")
-            last= d.get("fundingRate") or d.get("funding_rate")
-            tms = d.get("nextFundingTime") or d.get("next_funding_time")
-            rate_next = float(nxt) if nxt not in (None, "") else None
-            rate_last = float(last) if last not in (None, "") else None
-            next_ms   = int(tms) if tms else None
-            return rate_next, next_ms, rate_last
-    except Exception:
-        pass
-    # v2 fallback
-    try:
-        r2 = _retry_get("https://api.bybit.com/v2/public/tickers", {"symbol": symbol.upper()})
-        res = (r2 or {}).get("result") or []
-        if res:
-            d = res[0]
-            nxt = d.get("predicted_funding_rate")
-            last= d.get("funding_rate")
-            tms = d.get("next_funding_time")
-            rate_next = float(nxt) if nxt not in (None, "") else None
-            rate_last = float(last) if last not in (None, "") else None
-            next_ms   = int(tms) if tms else None
-            return rate_next, next_ms, rate_last
-    except Exception:
-        pass
-    return None, None, None
+    _start_bybit_ws_once()  # гарантируем, что сокет поднят
+    return BYBIT_FUNDING_CACHE.get(symbol.upper(), (None, None, None))
+
 
 def _mexc_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
     base, quote = _base_quote_from_symbol(symbol)
@@ -1534,7 +1613,7 @@ def scan_all(exchanges: List[str], symbols: List[str], symbols_by_ex: Optional[D
             row["direction"] = suggestion_from_rate(r8)
 
             # --- заменить/добавить перед rows.append(row) ---
-            rate_next, next_ms, rate_last = get_next_funding(ex, sym)
+            #rate_next, next_ms, rate_last = get_next_funding(ex, sym)
 
             # Если требуем next и биржа его не даёт — пропускаем инструмент
             if FUNDING_REQUIRE_NEXT and rate_next is None:
