@@ -191,7 +191,7 @@ def _okx_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
         data = (r or {}).get("data") or []
         if not data: return None, None, None
         d = data[0]
-        nxt = d.get("nextFundingRate")
+        nxt = d.get("fundingRate")
         cur = d.get("fundingRate")
         tms = d.get("fundingTime")
         rate_next = float(nxt) if nxt not in (None, "") else None
