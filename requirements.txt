@@ -1,11 +1,10 @@
 web3
-python-dotenv
-requests
-dotenv
-pandas
-google-cloud-storage
-websocket
 bybit
-urllib3
-six
-certifi
+requests==2.32.3
+urllib3==1.26.18   # совместим со старым bybit SDK и путём urllib3.packages.six
+six==1.16.0
+websocket-client>=1.8.0
+python-dotenv>=1.0.1
+pandas>=2.2.2
+google-cloud-storage>=2.16.0
+certifi>=2024.7.4
