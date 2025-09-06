@@ -203,27 +203,59 @@ def _okx_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
 
 def _bybit_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
     """
-    Bybit: пробуем вытащить predictedFundingRate из /v5/market/tickers.
-    Возвращаем (predictedFundingRate, nextFundingTime, fundingRate_last).
-    Если биржа не отдаёт прогноз, вернём (None, nextFundingTime, fundingRate_last).
+    Bybit USDT-перпы:
+      - следующий (прогноз текущего интервала): /v5/market/tickers -> fundingRate
+      - время следующего расчёта:               /v5/market/tickers -> nextFundingTime (ms)
+      - последняя рассчитанная ставка:          /v5/market/funding/history?limit=1 -> fundingRate
+    Возвращает (rate_next, next_ms, rate_last).
     """
+    def _to_float_safe(x):
+        try:
+            # если в проекте есть to_float – используем его
+            return to_float(x)  # type: ignore[name-defined]
+        except Exception:
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+    def _to_int_safe(x):
+        try:
+            return int(x)
+        except Exception:
+            return None
+
     try:
-        r = SESSION.get(
-            f"{bybit_base()}/v5/market/tickers",
-            params={"category": "linear", "symbol": (symbol or "").upper()},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if r.status_code != 200:
-            return None, None, None
-        j = r.json() or {}
-        lst = ((j.get("result") or {}).get("list")) or []
-        if not lst:
-            return None, None, None
-        d = lst[0] if isinstance(lst[0], dict) else {}
-        rate_pred = to_float(d.get("predictedFundingRate"))
-        rate_last = to_float(d.get("fundingRate"))
-        next_ms   = int(d.get("nextFundingTime")) if d.get("nextFundingTime") else None
-        return rate_pred, next_ms, rate_last
+        base = bybit_base()  # в проекте уже есть
+        sym = (symbol or "").upper()
+
+        # 1) Предстоящая (прогноз) ставка и время следующего фандинга
+        sess = SESSION if "SESSION" in globals() else requests
+        timeout = REQUEST_TIMEOUT if "REQUEST_TIMEOUT" in globals() else 10
+
+        r1 = sess.get(f"{base}/v5/market/tickers",
+                      params={"category": "linear", "symbol": sym},
+                      timeout=timeout)
+        j1 = r1.json() if getattr(r1, "json", None) else {}
+        lst1 = ((j1.get("result") or {}).get("list")) or []
+        rate_next = None
+        next_ms = None
+        if lst1:
+            d = lst1[0] if isinstance(lst1[0], dict) else {}
+            rate_next = _to_float_safe(d.get("fundingRate"))
+            next_ms = _to_int_safe(d.get("nextFundingTime"))
+
+        # 2) Последняя посчитанная ставка
+        r2 = sess.get(f"{base}/v5/market/funding/history",
+                      params={"category": "linear", "symbol": sym, "limit": 1},
+                      timeout=timeout)
+        j2 = r2.json() if getattr(r2, "json", None) else {}
+        lst2 = ((j2.get("result") or {}).get("list")) or []
+        rate_last = None
+        if lst2:
+            rate_last = _to_float_safe(lst2[0].get("fundingRate"))
+
+        return rate_next, next_ms, rate_last
     except Exception:
         return None, None, None
 
