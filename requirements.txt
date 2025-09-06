@@ -6,3 +6,6 @@ pandas
 google-cloud-storage
 websocket
 bybit
+urllib3
+six
+certifi
