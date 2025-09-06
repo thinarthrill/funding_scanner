@@ -42,6 +42,28 @@ import threading
 
 BYBIT_FUNDING_CACHE: dict[str, tuple[float|None, int|None, float|None]] = {}
 _BYBIT_WS_STARTED = False
+_BYBIT_WS = None              # type: websocket.WebSocketApp | None
+_BYBIT_SUBSCRIBED: set[str] = set()
+_BYBIT_PENDING: set[str] = set()
+
+def _bybit_queue_sub(symbol_up: str):
+    # кладём в очередь подписи; отправим, когда будет открыт WS
+    if not symbol_up:
+        return
+    if symbol_up in _BYBIT_SUBSCRIBED:
+        return
+    _BYBIT_PENDING.add(symbol_up)
+    # если сокет уже открыт — отправим моментально
+    try:
+        if _BYBIT_WS is not None:
+            args = [f"tickers.{s}" for s in list(_BYBIT_PENDING)]
+            if args:
+                _BYBIT_WS.send(json.dumps({"op": "subscribe", "args": args}))
+                _BYBIT_SUBSCRIBED.update(_BYBIT_PENDING)
+                _BYBIT_PENDING.clear()
+                logging.info("Bybit WS subscribed on-demand: %s", ", ".join(args[:5]) + ("..." if len(args) > 5 else ""))
+    except Exception as e:
+        logging.debug("Bybit WS on-demand subscribe error: %s", e)
 
 # ------------------------------
 # ENV helpers
@@ -179,26 +201,53 @@ def _okx_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
         return rate_next, next_ms, rate_last
     except Exception:
         return None, None, None
+
 def _bybit_ws_url() -> str:
     return "wss://stream-testnet.bybit.com/v5/public/linear" if getenv_bool("BYBIT_TESTNET", False) \
            else "wss://stream.bybit.com/v5/public/linear"
 
+def _bybit_queue_sub(symbol_up: str):
+    if not symbol_up or symbol_up in _BYBIT_SUBSCRIBED: 
+        return
+    _BYBIT_PENDING.add(symbol_up)
+    try:
+        if _BYBIT_WS is not None:
+            args = [f"tickers.{s}" for s in list(_BYBIT_PENDING)]
+            if args:
+                _BYBIT_WS.send(json.dumps({"op": "subscribe", "args": args}))
+                _BYBIT_SUBSCRIBED.update(_BYBIT_PENDING)
+                _BYBIT_PENDING.clear()
+                logging.info("Bybit WS subscribed on-demand: %s", ", ".join(args[:5]) + ("..." if len(args) > 5 else ""))
+    except Exception as e:
+        logging.debug("Bybit WS on-demand subscribe error: %s", e)
+
 def _start_bybit_ws_once():
-    global _BYBIT_WS_STARTED
+    global _BYBIT_WS_STARTED, _BYBIT_WS
     if _BYBIT_WS_STARTED:
         return
     _BYBIT_WS_STARTED = True
 
+    def _flush_pending(ws):
+        try:
+            if _BYBIT_PENDING:
+                args = [f"tickers.{s}" for s in list(_BYBIT_PENDING)]
+                ws.send(json.dumps({"op": "subscribe", "args": args}))
+                _BYBIT_SUBSCRIBED.update(_BYBIT_PENDING)
+                _BYBIT_PENDING.clear()
+                logging.info("Bybit WS subscribed: %s", ", ".join(args[:5]) + ("..." if len(args) > 5 else ""))
+        except Exception as e:
+            logging.debug("Bybit WS flush_pending err: %s", e)
+
     def _on_msg(payload: dict):
         try:
-            if not isinstance(payload, dict) or payload.get("topic") != "tickers":
+            if payload.get("op") == "subscribe" or payload.get("success") is True or payload.get("ret_msg") == "OK":
                 return
-            rows = payload.get("data") or []
-            if isinstance(rows, dict):
-                rows = [rows]
-            for d in rows:
-                if not isinstance(d, dict): 
-                    continue
+            if payload.get("topic") != "tickers":
+                return
+            data = payload.get("data") or []
+            if isinstance(data, dict):
+                data = [data]
+            for d in data:
                 sym  = (d.get("symbol") or "").upper()
                 if not sym:
                     continue
@@ -214,26 +263,35 @@ def _start_bybit_ws_once():
             logging.debug("Bybit WS parse err: %s", e)
 
     def _on_open(ws):
-        ws.send(json.dumps({"op":"subscribe","args":["tickers.*"]}))
-        logging.info("Bybit WS subscribed: tickers.*")
+        logging.info("Bybit WS open")
+        _flush_pending(ws)
 
     def _on_message(ws, message: str):
         try:
-            _on_msg(json.loads(message))
+            payload = json.loads(message)
         except Exception:
-            pass
+            return
+        _on_msg(payload)
+
+    def _on_error(ws, err):
+        logging.warning("Bybit WS error: %s", err)
+
+    def _on_close(ws, code, msg):
+        logging.info("Bybit WS closed: %s %s", code, msg)
 
     def _loop():
         url = _bybit_ws_url()
         while True:
             try:
-                websocket.WebSocketApp(
+                ws = websocket.WebSocketApp(
                     url,
                     on_open=_on_open,
                     on_message=_on_message,
-                    on_error=lambda ws, err: logging.warning("Bybit WS error: %s", err),
-                    on_close=lambda ws, code, msg: logging.info("Bybit WS closed: %s %s", code, msg),
-                ).run_forever(ping_interval=20, ping_timeout=10)
+                    on_error=_on_error,
+                    on_close=_on_close,
+                )
+                _BYBIT_WS = ws
+                ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
                 logging.warning("Bybit WS reconnect in 5s: %s", e)
                 time.sleep(5)
@@ -241,9 +299,11 @@ def _start_bybit_ws_once():
     threading.Thread(target=_loop, daemon=True).start()
 
 def _bybit_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
-    _start_bybit_ws_once()  # гарантируем, что сокет поднят
-    return BYBIT_FUNDING_CACHE.get(symbol.upper(), (None, None, None))
-
+    _start_bybit_ws_once()
+    sym = (symbol or "").upper()
+    if sym and sym not in _BYBIT_SUBSCRIBED:
+        _bybit_queue_sub(sym)     # ← ключ: лениво подписываемся на tickers.<SYMBOL>
+    return BYBIT_FUNDING_CACHE.get(sym, (None, None, None))
 
 def _mexc_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
     base, quote = _base_quote_from_symbol(symbol)
@@ -404,68 +464,6 @@ def _bybit_ws_url() -> str:
     # если пользуешь BYBIT_TESTNET=1 — подключится тестнет-стрим
     return "wss://stream-testnet.bybit.com/v5/public/linear" if getenv_bool("BYBIT_TESTNET", False) \
            else "wss://stream.bybit.com/v5/public/linear"
-
-def _start_bybit_ws_once():
-    """Поднять Bybit public WebSocket (topic=tickers.*) один раз и наполнять BYBIT_FUNDING_CACHE."""
-    global _BYBIT_WS_STARTED
-    if _BYBIT_WS_STARTED:
-        return
-    _BYBIT_WS_STARTED = True
-
-    def _on_msg(payload: dict):
-        try:
-            # ожидаем v5: {"topic":"tickers","data":[{...}]}
-            if not isinstance(payload, dict) or payload.get("topic") != "tickers":
-                return
-            rows = payload.get("data") or []
-            if isinstance(rows, dict):
-                rows = [rows]
-            for d in rows:
-                if not isinstance(d, dict):
-                    continue
-                sym  = (d.get("symbol") or "").upper()
-                if not sym:
-                    continue
-                nxt  = d.get("predictedFundingRate") or d.get("predicted_funding_rate")
-                last = d.get("fundingRate")          or d.get("funding_rate")
-                tms  = d.get("nextFundingTime")      or d.get("next_funding_time")
-                BYBIT_FUNDING_CACHE[sym] = (
-                    float(nxt)  if nxt  not in (None, "", "null") else None,
-                    int(tms)    if tms  else None,
-                    float(last) if last not in (None, "", "null") else None,
-                )
-        except Exception as e:
-            logging.debug("Bybit WS parse err: %s", e)
-
-    # raw websocket-client
-    def _on_open(ws):
-        sub = {"op": "subscribe", "args": ["tickers.*"]}  # все USDT-перпы
-        ws.send(json.dumps(sub))
-        logging.info("Bybit WS subscribed: tickers.*")
-
-    def _on_message(ws, message: str):
-        try:
-            payload = json.loads(message)
-        except Exception:
-            return
-        _on_msg(payload)
-
-    def _loop():
-        url = _bybit_ws_url()
-        while True:
-            try:
-                websocket.WebSocketApp(
-                    url,
-                    on_open=_on_open,
-                    on_message=_on_message,
-                    on_error=lambda ws, err: logging.warning("Bybit WS error: %s", err),
-                    on_close=lambda ws, code, msg: logging.info("Bybit WS closed: %s %s", code, msg),
-                ).run_forever(ping_interval=20, ping_timeout=10)
-            except Exception as e:
-                logging.warning("Bybit WS reconnect in 5s: %s", e)
-                time.sleep(5)
-
-    threading.Thread(target=_loop, daemon=True).start()
 
 # ------------------------------
 # GCS helpers + BACKET support
