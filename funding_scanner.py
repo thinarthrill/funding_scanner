@@ -1662,6 +1662,32 @@ def _taker_fee_for(ex: str, default_fee: float) -> float:
     per_ex = {"bybit": 0.00055}  # можно расширять
     return float(per_ex.get(ex, default_fee))
 
+def _funding_sign(rate: Optional[float]) -> int:
+    """
+    Returns +1 if rate>0, -1 if rate<0, 0 if None or 0.
+    """
+    if rate is None:
+        return 0
+    return 1 if rate > 0 else (-1 if rate < 0 else 0)
+
+def _is_opposite(a: Optional[float], b: Optional[float]) -> bool:
+    """
+    True only when signs are opposite (strict), i.e. +/− or −/+.
+    """
+    sa, sb = _funding_sign(a), _funding_sign(b)
+    return (sa * sb) == -1
+
+def _recommended_side(rate: Optional[float]) -> str:
+    """
+    For funding arbitrage we always take the receiving side:
+    - if rate>0 (longs pay), we SHORT to receive
+    - if rate<0 (shorts pay), we LONG to receive
+    - else → FLAT (skip)
+    """
+    if rate is None or rate == 0:
+        return "FLAT"
+    return "SHORT" if rate > 0 else "LONG"
+
 def build_cross_exchange_candidates(
     df_raw: pd.DataFrame,
     expected_h: float,
@@ -2027,21 +2053,16 @@ def main():
         long_a   = _anchor_symbol(long_ex,  sym, "perp")
         short_a  = _anchor_symbol(short_ex, sym, "perp")
 
-        # Определим направление по ставке (next → приоритет, иначе last)
-        def _funding_side(rate: float | None):
-            if rate is None:
-                return "⚪", "FLAT"
-            if rate > 0:
-                return "🔴", "SHORT"
-            if rate < 0:
-                return "🟢", "LONG"
-            return "⚪", "FLAT"
-
-        rate_long  = best.get("rate_8h_next") or best.get("rate_8h_last") or best.get("rate_8h")
-        rate_short = best.get("rate_8h_next") or best.get("rate_8h_last") or best.get("rate_8h")
-
-        emo_long, side_long   = _funding_side(rate_long)
-        emo_short, side_short = _funding_side(rate_short)
+        # Стороны определяем по APR в кандидате:
+        #  - apr_short  > 0 → на этой бирже платят лонги → мы SHORT
+        #  - apr_long_abs > 0 → на той бирже платят шорты → мы LONG
+        apr_short    = float(best.get("apr_short") or 0.0)
+        apr_long_abs = float(best.get("apr_long_abs") or 0.0)
+        emo_short, side_short = ("🔴", "SHORT") if apr_short > 0 else ("⚪", "FLAT")
+        emo_long,  side_long  = ("🟢", "LONG")  if apr_long_abs > 0 else ("⚪", "FLAT")
+        # Если вдруг какая-то сторона FLAT — не шлём карточку
+        if "FLAT" in (side_long, side_short):
+            return
 
         msg = (
             "📈 <b>Best cross-ex funding</b>\n"
