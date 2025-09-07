@@ -2073,7 +2073,6 @@ def main():
             f"  • {short_ex.upper()} {emo_short} {side_short}\n\n"
             f"<b>Profit/day (net):</b> ${float(best['net_day_usd']):.2f}\n"
             f"  • Funding/day: ${float(best['funding_day_usd']):.2f}\n  • Fees/day: ${float(best['fees_day_usd']):.2f}\n"
-            f"Expected ({int(expected_h)}h): ${expected_net:.2f}\n"
             f"<b>Expected ({int(expected_h)}h):</b> ${float(best['net_usd']):.2f} "
             f"(funding ${float(best['funding_usd']):.2f} − fees ${float(best['fees_usd']):.2f})"
         )
