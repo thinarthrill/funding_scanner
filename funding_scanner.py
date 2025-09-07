@@ -278,35 +278,47 @@ def _bybit_queue_sub(symbol_up: str):
     except Exception as e:
         logging.debug("Bybit WS on-demand subscribe error: %s", e)
 
+def _next_8h_utc_ms(now_ms: int) -> int:
+    """Вернёт начало следующего 8-часового окна в UTC в миллисекундах."""
+    step = 8 * 3600  # секунд
+    secs = now_ms // 1000
+    return int(((secs // step) + 1) * step * 1000)
+
 def _mexc_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
+    """MEXC futures: используем официальные REST-эндпоинты из доков."""
     base, quote = _base_quote_from_symbol(symbol)
-    sym_u = f"{base}_{quote}"
-    # 1) contract fundingRate
+    sym_u = f"{base}_{quote}"  # формат BTC_USDT
+    rate_next, next_ms, rate_last = None, None, None
+    # 1) прогноз текущего окна + время следующего фандинга
     try:
-        r1 = _retry_get("https://contract.mexc.com/api/v1/contract/fundingRate", {"symbol": sym_u})
-        d = (r1 or {}).get("data") or {}
-        nxt = d.get("nextFundingRate") or d.get("predictedFundingRate") or d.get("predicted_funding_rate")
-        last= d.get("fundingRate") or d.get("funding_rate")
-        tms = d.get("nextFundingTime") or d.get("next_funding_time")
-        rate_next = float(nxt) if nxt not in (None, "") else None
-        rate_last = float(last) if last not in (None, "") else None
-        next_ms   = int(tms) if tms else None
-        if rate_next is not None:
-            return rate_next, next_ms, rate_last
+        r1 = _retry_get(f"https://contract.mexc.com/api/v1/contract/funding_rate/{sym_u}", {})
+        d1 = (r1 or {}).get("data") or {}
+        if d1:
+            rate_next = to_float(d1.get("fundingRate"))
+            # у MEXC поле называется nextSettleTime (в мс)
+            tms = d1.get("nextSettleTime") or d1.get("next_funding_time")
+            next_ms = int(tms) if tms else None
     except Exception:
         pass
-    # 2) premiumIndex
+    # 2) last из истории (последний рассчитанный)
     try:
-        r2 = _retry_get("https://contract.mexc.com/api/v1/contract/premiumIndex", {"symbol": sym_u})
-        d = (r2 or {}).get("data") or {}
-        nxt = d.get("predictedFundingRate") or d.get("predicted_funding_rate")
-        tms = d.get("nextFundingTime") or d.get("next_funding_time")
-        rate_next = float(nxt) if nxt not in (None, "") else None
-        next_ms   = int(tms) if tms else None
-        return rate_next, next_ms, None
+        r2 = _retry_get("https://contract.mexc.com/api/v1/contract/funding_rate/history",
+                        {"symbol": sym_u, "page_size": 1})
+        d2 = ((r2 or {}).get("data") or {}).get("resultList") or []
+        if d2:
+            rate_last = to_float(d2[0].get("fundingRate"))
     except Exception:
         pass
-    return None, None, None
+    # 3) фоллбек: если rate_next не пришёл — возьмём из тикера
+    if rate_next is None:
+        try:
+            r3 = _retry_get("https://contract.mexc.com/api/v1/contract/ticker", {"symbol": sym_u})
+            d3 = (r3 or {}).get("data") or {}
+            if d3:
+                rate_next = to_float(d3.get("fundingRate"))
+        except Exception:
+            pass
+    return rate_next, next_ms, rate_last
 
 def _kucoin_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
     # KuCoin Futures: активные контракты содержат predictedFundingFeeRate/nextFundingTime
