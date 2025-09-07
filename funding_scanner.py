@@ -2026,16 +2026,37 @@ def main():
         long_ex  = str(best['long_ex']); short_ex = str(best['short_ex']); sym = str(best['symbol']).upper()
         long_a   = _anchor_symbol(long_ex,  sym, "perp")
         short_a  = _anchor_symbol(short_ex, sym, "perp")
+
+        # Определим направление по ставке (next → приоритет, иначе last)
+        def _funding_side(rate: float | None):
+            if rate is None:
+                return "⚪", "FLAT"
+            if rate > 0:
+                return "🔴", "SHORT"
+            if rate < 0:
+                return "🟢", "LONG"
+            return "⚪", "FLAT"
+
+        rate_long  = best.get("rate_8h_next") or best.get("rate_8h_last") or best.get("rate_8h")
+        rate_short = best.get("rate_8h_next") or best.get("rate_8h_last") or best.get("rate_8h")
+
+        emo_long, side_long   = _funding_side(rate_long)
+        emo_short, side_short = _funding_side(rate_short)
+
         msg = (
             "📈 <b>Best cross-ex funding</b>\n"
             f"{long_a} / {short_a}\n"
             f"Combo APR: {float(best['apr_combo'])*100:.2f}%\n\n"
+            f"Sides:\n"
+            f"  • {long_ex.upper()} {emo_long} {side_long}\n"
+            f"  • {short_ex.upper()} {emo_short} {side_short}\n\n"
             f"<b>Profit/day (net):</b> ${float(best['net_day_usd']):.2f}\n"
             f"  • Funding/day: ${float(best['funding_day_usd']):.2f}\n  • Fees/day: ${float(best['fees_day_usd']):.2f}\n"
             f"Expected ({int(expected_h)}h): ${expected_net:.2f}\n"
             f"<b>Expected ({int(expected_h)}h):</b> ${float(best['net_usd']):.2f} "
             f"(funding ${float(best['funding_usd']):.2f} − fees ${float(best['fees_usd']):.2f})"
         )
+
         maybe_send_telegram(msg)
 
     # симуляция/исполнение + Telegram апдейты (кросс-позы)
