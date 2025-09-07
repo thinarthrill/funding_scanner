@@ -1779,7 +1779,7 @@ def positions_open_close_loop(
         if have_rates and (apr_combo*100.0 < float(exit_apr_threshold)):
             do_close = True; reason = f"APR fell below EXIT ({apr_combo*100:.2f}% < {exit_apr_threshold:.2f}%)"
         if df_pos.at[i,"held_h"] >= float(max_holding_h):
-            do_close = True; reason = f"MAX_HOLDING_H reached ({df_pos.at[i]['held_h']:.1f}h)"
+            do_close = True; reason = f"MAX_HOLDING_H reached ({df_pos.at[i,'held_h']:.1f}h)"
 
         if do_close:
             if not paper:
