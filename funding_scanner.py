@@ -29,7 +29,6 @@ import hmac, hashlib, time
 from typing import Dict, Any, List, Optional, Set, Any as AnyT
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-
 load_dotenv()  # подгрузить .env
 
 import certifi
@@ -1476,19 +1475,107 @@ def _qty_from_notional(price: float, notional: float) -> float:
     if not price or price <= 0: return 0.0
     return round(float(notional)/float(price), 6)
 
+def _binance_lot_filters(symbol: str) -> tuple[float|None, float|None]:
+    """
+    Возвращает (stepSize, minQty) для UM-фьючерса символа.
+    """
+    try:
+        r = SESSION.get(f"{binance_fapi_base()}/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            return None, None
+        info = r.json() or {}
+        sym = (symbol or "").upper()
+        for s in info.get("symbols", []):
+            if s.get("symbol") == sym and s.get("contractType") == "PERPETUAL":
+                step, mn = None, None
+                for f in s.get("filters", []):
+                    # На UM фьючерсах встречаются LOT_SIZE и MARKET_LOT_SIZE
+                    if f.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+                        try:
+                            step = float(f.get("stepSize")) if f.get("stepSize") is not None else step
+                            mn   = float(f.get("minQty"))  if f.get("minQty")  is not None else mn
+                        except Exception:
+                            pass
+                return step, mn
+    except Exception:
+        pass
+    return None, None
+
+def _quantize_down(x: float, step: float) -> float:
+    if step is None or step <= 0: 
+        return x
+    import math
+    return math.floor(x / step) * step
+
+def _adjust_binance_qty(symbol: str, qty: float) -> float:
+    """
+    Приводит qty к шагу и минимуму лота Binance (UM futures).
+    """
+    step, mn = _binance_lot_filters(symbol)
+    if step:
+        qty = _quantize_down(qty, step)
+        # Из-за плавающей точки округлим до разумного числа знаков
+        qty = float(("{:.10f}".format(qty)).rstrip("0").rstrip(".")) if qty != 0 else 0.0
+    if mn and qty < mn:
+        return 0.0
+    return qty
+
 def execute_open_perp_pair(long_ex: str, short_ex: str, symbol: str, price: float, per_leg_notional_usd: float):
-    qty = _qty_from_notional(price, per_leg_notional_usd)
-    if long_ex == "binance": binance_futures_order(symbol, "BUY", qty, reduce_only=False)
-    if long_ex == "bybit":   bybit_place_order(symbol, "Buy", qty, reduce_only=False)
-    if short_ex == "binance": binance_futures_order(symbol, "SELL", qty, reduce_only=False)
-    if short_ex == "bybit":   bybit_place_order(symbol, "Sell", qty, reduce_only=False)
+    # Если цена не пришла — попробуем добрать markPrice из биржи
+    px = price
+    if (px is None or px <= 0):
+        if long_ex == "binance" or short_ex == "binance":
+            pi = binance_premium_index(symbol)
+            px = (pi or {}).get("price") or px
+        if (px is None or px <= 0) and (long_ex == "bybit" or short_ex == "bybit"):
+            px = fetch_bybit_mark_price(symbol) or px
+    if px is None or px <= 0:
+        logging.warning("Skip open: no mark price for %s (long=%s short=%s)", symbol, long_ex, short_ex)
+        return
+
+    qty = _qty_from_notional(px, per_leg_notional_usd)
+    # Приведение qty к требованиям биржи
+    qty_long, qty_short = qty, qty
+    if long_ex == "binance":
+        qty_long = _adjust_binance_qty(symbol, qty_long)
+    if short_ex == "binance":
+        qty_short = _adjust_binance_qty(symbol, qty_short)
+
+    # Проверки на нулевые количества после нормализации
+    if long_ex == "binance" and qty_long <= 0:
+        logging.warning("Binance long qty normalized to 0 for %s — skip long leg", symbol)
+    if short_ex == "binance" and qty_short <= 0:
+        logging.warning("Binance short qty normalized to 0 for %s — skip short leg", symbol)
+
+    # Отправка ордеров только если qty > 0
+    if long_ex == "binance" and qty_long > 0: binance_futures_order(symbol, "BUY", qty_long, reduce_only=False)
+    if long_ex == "bybit"   and qty_long > 0: bybit_place_order(symbol, "Buy",  qty_long, reduce_only=False)
+    if short_ex == "binance" and qty_short > 0: binance_futures_order(symbol, "SELL", qty_short, reduce_only=False)
+    if short_ex == "bybit"   and qty_short > 0: bybit_place_order(symbol, "Sell", qty_short, reduce_only=False)
 
 def execute_close_perp_pair(long_ex: str, short_ex: str, symbol: str, price: float, per_leg_notional_usd: float):
-    qty = _qty_from_notional(price, per_leg_notional_usd)
-    if long_ex == "binance": binance_futures_order(symbol, "SELL", qty, reduce_only=True)
-    if long_ex == "bybit":   bybit_place_order(symbol, "Sell", qty, reduce_only=True)
-    if short_ex == "binance": binance_futures_order(symbol, "BUY", qty, reduce_only=True)
-    if short_ex == "bybit":   bybit_place_order(symbol, "Buy", qty, reduce_only=True)
+    px = price
+    if (px is None or px <= 0):
+        if long_ex == "binance" or short_ex == "binance":
+            pi = binance_premium_index(symbol)
+            px = (pi or {}).get("price") or px
+        if (px is None or px <= 0) and (long_ex == "bybit" or short_ex == "bybit"):
+            px = fetch_bybit_mark_price(symbol) or px
+    if px is None or px <= 0:
+        logging.warning("Skip close: no mark price for %s (long=%s short=%s)", symbol, long_ex, short_ex)
+        return
+
+    qty = _qty_from_notional(px, per_leg_notional_usd)
+    qty_long, qty_short = qty, qty
+    if long_ex == "binance":
+        qty_long = _adjust_binance_qty(symbol, qty_long)
+    if short_ex == "binance":
+        qty_short = _adjust_binance_qty(symbol, qty_short)
+
+    if long_ex == "binance" and qty_long > 0: binance_futures_order(symbol, "SELL", qty_long, reduce_only=True)
+    if long_ex == "bybit"   and qty_long > 0: bybit_place_order(symbol, "Sell",  qty_long, reduce_only=True)
+    if short_ex == "binance" and qty_short > 0: binance_futures_order(symbol, "BUY", qty_short, reduce_only=True)
+    if short_ex == "bybit"   and qty_short > 0: bybit_place_order(symbol, "Buy",  qty_short, reduce_only=True)
 
 # ------------------------------
 # Binance Top symbols util (optional)
@@ -1617,7 +1704,7 @@ def scan_all(exchanges: List[str], symbols: List[str], symbols_by_ex: Optional[D
             row["apr_pct"] = round(apr*100, 4) if apr is not None else None
             row["rate_8h_pct"] = round(r8*100, 6) if r8 is not None else None
             row["time_utc"] = fmt_ts(row.get("ts"))
-            row["next_funding_utc"] = fmt_ts(row.get("next_funding_time"))
+            row["next_funding_utc"] = fmt_ts(next_ms)
             row["direction"] = suggestion_from_rate(r8)
 
             # --- заменить/добавить перед rows.append(row) ---
@@ -1644,7 +1731,7 @@ def scan_all(exchanges: List[str], symbols: List[str], symbols_by_ex: Optional[D
             # Таймстемп следующего фандинга (если дали) — для Телеграма
             if next_ms:
                 row["next_funding_time"] = next_ms
-                row["next_funding_utc"] = datetime.utcfromtimestamp(next_ms/1000).strftime("%Y-%m-%d %H:%M:%S UTC")
+                row["next_funding_utc"] = fmt_ts(next_ms)
 
             rows.append(row)
     return pd.DataFrame(rows)
