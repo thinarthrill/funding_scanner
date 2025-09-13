@@ -232,7 +232,7 @@ def _bybit_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
         sess = SESSION if "SESSION" in globals() else requests
         timeout = REQUEST_TIMEOUT if "REQUEST_TIMEOUT" in globals() else 10
 
-        r1 = sess.get(f"{base}/v5/market/tickers",
+        r1 = sess.get(f"{bybit_base_data()}/v5/market/tickers",
                       params={"category": "linear", "symbol": sym},
                       timeout=timeout)
         j1 = r1.json() if getattr(r1, "json", None) else {}
@@ -245,7 +245,7 @@ def _bybit_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
             next_ms = _to_int_safe(d.get("nextFundingTime"))
 
         # 2) Последняя посчитанная ставка
-        r2 = sess.get(f"{base}/v5/market/funding/history",
+        r2 = sess.get(f"{bybit_base_data()}/v5/market/funding/history",
                       params={"category": "linear", "symbol": sym, "limit": 1},
                       timeout=timeout)
         j2 = r2.json() if getattr(r2, "json", None) else {}
@@ -621,6 +621,24 @@ def bybit_base() -> str:
 def binance_fapi_base() -> str:
     return "https://testnet.binancefuture.com" if getenv_bool("BINANCE_API_TESTNET", False) else "https://fapi.binance.com"
 
+def bybit_base_data() -> str:
+    """
+    База для ЧТЕНИЯ данных (котировки/фандинги): всегда прод, если BYBIT_DATA_MAINNET=1,
+    иначе следуем bybit_base() (чтобы можно было вернуть старое поведение).
+    """
+    if getenv_bool("BYBIT_DATA_MAINNET", True):
+        return "https://api.bybit.com"
+    return bybit_base()
+
+def binance_fapi_base_data() -> str:
+    """
+    База для ЧТЕНИЯ данных (котировки/фандинги) по Binance Futures:
+    если BINANCE_DATA_MAINNET=1 → всегда https://fapi.binance.com, независимо от тестнета для ордеров.
+    """
+    if getenv_bool("BINANCE_DATA_MAINNET", True):
+        return "https://fapi.binance.com"
+    return binance_fapi_base()
+
 def okx_base() -> str:
     return "https://www.okx.com"
 
@@ -942,7 +960,9 @@ def binance_sync_time():
     """Раз в ~60с подтягиваем serverTime и считаем смещение."""
     global BINANCE_TIME_OFFSET_MS, _BINANCE_TIME_SYNCED_AT
     try:
-        r = SESSION.get(f"{binance_fapi_base()}/fapi/v1/time", timeout=REQUEST_TIMEOUT)
+        r = SESSION.get(f"{binance_fapi_base_data()}/fapi/v1/premiumIndex",
+                     params={"symbol": symbol.upper()},
+                     timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             srv = int(r.json().get("serverTime"))
             now = int(time.time() * 1000)
@@ -1028,7 +1048,7 @@ def binance_premium_index(symbol: str) -> Optional[Dict[str, Any]]:
 # Bybit
 def fetch_bybit_mark_price(symbol: str) -> Optional[float]:
     try:
-        r = SESSION.get(f"{bybit_base()}/v5/market/instruments-info",
+        r = SESSION.get(f"{bybit_base_data()}/v5/market/instruments-info",
                         params={"category": "linear", "symbol": symbol.upper()},
                         timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
@@ -1043,7 +1063,7 @@ def fetch_bybit_mark_price(symbol: str) -> Optional[float]:
 
 def bybit_latest_funding(symbol: str) -> Optional[Dict[str, Any]]:
     try:
-        r = SESSION.get(f"{bybit_base()}/v5/market/instruments-info",
+        r = SESSION.get(f"{bybit_base_data()}/v5/market/instruments-info",
                         params={"category":"linear","symbol":symbol.upper(),"limit":1},
                         timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
