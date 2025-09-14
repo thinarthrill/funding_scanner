@@ -240,7 +240,8 @@ def _bybit_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
             return None
 
     try:
-        base = bybit_base()  # в проекте уже есть
+        # читать ДАННЫЕ всегда с прода (ордера могут идти на тестнет по ENV)
+        base = bybit_base_data()
         sym = (symbol or "").upper()
 
         # 1) Предстоящая (прогноз) ставка и время следующего фандинга
@@ -972,12 +973,9 @@ BINANCE_TIME_OFFSET_MS = 0
 _BINANCE_TIME_SYNCED_AT = 0
 
 def binance_sync_time():
-    """Раз в ~60с подтягиваем serverTime и считаем смещение."""
     global BINANCE_TIME_OFFSET_MS, _BINANCE_TIME_SYNCED_AT
     try:
-        r = SESSION.get(f"{binance_fapi_base_data()}/fapi/v1/premiumIndex",
-                     params={"symbol": symbol.upper()},
-                     timeout=REQUEST_TIMEOUT)
+        r = SESSION.get(f"{binance_fapi_base_data()}/fapi/v1/time", timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             srv = int(r.json().get("serverTime"))
             now = int(time.time() * 1000)
@@ -1042,7 +1040,8 @@ def binance_auth_healthcheck():
 # Binance funding/mark
 def binance_premium_index(symbol: str) -> Optional[Dict[str, Any]]:
     try:
-        r = SESSION.get(f"{binance_fapi_base()}/fapi/v1/premiumIndex",
+        # Маркет-данные — только из продового data-базового URL
+        r = SESSION.get(f"{binance_fapi_base_data()}/fapi/v1/premiumIndex",
                         params={"symbol": symbol.upper()},
                         timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
@@ -1529,30 +1528,32 @@ def _binance_lot_filters(symbol: str) -> tuple[float|None, float|None]:
         sym = (symbol or "").upper()
         for s in info.get("symbols", []):
             if s.get("symbol") == sym and s.get("contractType") == "PERPETUAL":
+                # внутри if s["symbol"] == sym ...
                 step, mn = None, None
                 for f in s.get("filters", []):
-                    # На UM фьючерсах встречаются LOT_SIZE и MARKET_LOT_SIZE
-                    if f.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+                    if f.get("filterType") in ("LOT_SIZE","MARKET_LOT_SIZE"):
                         try:
                             step = float(f.get("stepSize")) if f.get("stepSize") is not None else step
                             mn   = float(f.get("minQty"))  if f.get("minQty")  is not None else mn
                         except Exception:
                             pass
-                    if not _is_pos_finite(step):
-                        step = None
-                        if not _is_pos_finite(mn):
-                            mn = None
-                        return step, mn
+                if not (_is_pos_finite(step) and step > 0): step = None
+                if not (_is_pos_finite(mn) and mn > 0): mn = None
                 return step, mn
+
     except Exception:
         pass
     return None, None
 
 def _quantize_down(x: float, step: float) -> float:
-    if step is None or step <= 0: 
+    try:
+        import math
+        s = float(step)
+        if not (math.isfinite(s) and s > 0.0):
+            return x
+        return math.floor(float(x) / s) * s
+    except Exception:
         return x
-    import math
-    return math.floor(x / step) * step
 
 def _adjust_binance_qty(symbol: str, qty: float) -> float:
     """
@@ -1629,7 +1630,8 @@ def execute_close_perp_pair(long_ex: str, short_ex: str, symbol: str, price: flo
 # ------------------------------
 def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List[str]:
     try:
-        exinfo = SESSION.get(f"{binance_fapi_base()}/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT)
+        # Для отбора топ-символов также используем data-базу
+        exinfo = SESSION.get(f"{binance_fapi_base_data()}/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT)
         exinfo.raise_for_status()
         info = exinfo.json()
         perp_usdt = {
@@ -1638,8 +1640,8 @@ def binance_top_perp_usdt(top_n: int = 200, min_quote_usdt: float = 0.0) -> List
             and s.get("quoteAsset") == "USDT"
             and s.get("status") == "TRADING"
         }
-        # TODO: заменить на fapi/v1/ticker/24hr при желании
-        t24 = SESSION.get(f"{binance_fapi_base()}/fapi/v1/ticker/24hr", timeout=REQUEST_TIMEOUT)
+        # 24h тики тоже с data-базы
+        t24 = SESSION.get(f"{binance_fapi_base_data()}/fapi/v1/ticker/24hr", timeout=REQUEST_TIMEOUT)
         items = []
         for r in t24.json():
             sym = r.get("symbol")
@@ -1704,10 +1706,26 @@ if use_per_ex and matrix_path:
 
 def scan_all(exchanges: List[str], symbols: List[str], symbols_by_ex: Optional[Dict[str, List[str]]] = None) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
+    # Кэш листинга Binance (из prod-data) на время одного скана
+    binance_listed: Optional[Set[str]] = None
     for ex in exchanges:
         ex_symbols = symbols_by_ex.get(ex) if symbols_by_ex else None
         if ex_symbols is None:
             ex_symbols = symbols
+        # Жёсткая фильтрация для Binance: оставляем только реально листящиеся USDT-перпы
+        if ex == "binance":
+            if binance_listed is None:
+                try:
+                    binance_listed = list_binance_perp_usdt()
+                    logging.info("Binance listing (prod): %d symbols", len(binance_listed))
+                except Exception as e:
+                    logging.warning("Binance listing fetch failed, will not filter: %s", e)
+                    binance_listed = set()
+            if binance_listed:
+                before = len(ex_symbols)
+                ex_symbols = [s for s in ex_symbols if s.upper() in binance_listed]
+                if before != len(ex_symbols):
+                    logging.info("Binance filtered symbols: %d → %d", before, len(ex_symbols))
         if not ex_symbols:
             continue
         for sym in ex_symbols:
@@ -2363,7 +2381,9 @@ def main():
 LISTERS = {}  # переопределяется ниже после всех lister_* объявлений
 
 def list_binance_perp_usdt() -> Set[str]:
-    r = SESSION.get(f"{binance_fapi_base()}/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT); r.raise_for_status()
+    # Всегда берём список торгуемых перпов с ПРОДОВОГО data-базы Binance,
+    # даже если ордера идут на тестнет. Это исключает "фантомные" символы.
+    r = SESSION.get(f"{binance_fapi_base_data()}/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT); r.raise_for_status()
     out=set()
     for s in r.json().get("symbols", []):
         if s.get("contractType")=="PERPETUAL" and s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING":
