@@ -451,7 +451,13 @@ def _binance_next_rate(symbol: str) -> tuple[float|None, int|None, float|None]:
 def get_next_funding(exchange: str, symbol: str) -> tuple[float|None, int|None, float|None]:
     ex = (exchange or "").lower()
     if   ex == "okx":     return _okx_next_rate(symbol)
-    elif ex == "bybit":   return _bybit_next_rate(symbol)
+    elif ex == "binance":
+        pi = binance_premium_index(symbol) or {}
+        # Binance: берём lastFundingRate и nextFundingTime из /premiumIndex
+        last   = to_float(pi.get("lastFundingRate"))
+        next_ms = int(pi["nextFundingTime"]) if pi.get("nextFundingTime") else None
+        # Прогноз next-rate публично не дают → вернём (None, next_ms, last)
+        return None, next_ms, last
     elif ex == "mexc":    return _mexc_next_rate(symbol)
     elif ex == "kucoin":  return _kucoin_next_rate(symbol)
     elif ex == "deribit": return _deribit_next_rate(symbol)
@@ -459,7 +465,7 @@ def get_next_funding(exchange: str, symbol: str) -> tuple[float|None, int|None, 
     elif ex == "gate":    return _gate_next_rate(symbol)
     elif ex == "phemex":  return _phemex_next_rate(symbol)
     elif ex == "krakenf": return _krakenf_next_rate(symbol)
-    elif ex == "binance": return _binance_next_rate(symbol)
+    elif ex == "bybit":   return _bybit_next_rate(symbol)
     return None, None, None
 
 # ------------------------------
@@ -740,6 +746,24 @@ def maybe_send_telegram(text: str) -> None:
     except Exception as e:
         logging.warning("Telegram exception: %s", e)
 
+def maybe_send_telegram_error(text: str, details: Optional[str] = None) -> None:
+    if not getenv_bool("TELEGRAM_ERRORS", False):
+        return
+    if getenv_bool("TELEGRAM_ERRORS_VERBOSE", False) and details:
+        text = f"{text}\n<code>{details[:1800]}</code>"
+    try:
+        token = getenv_str("TELEGRAM_BOT_TOKEN", "")
+        chat_id = getenv_str("TELEGRAM_CHAT_ID", "")
+        if not token or not chat_id:
+            return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": f"❌ {text}", "disable_web_page_preview": True, "parse_mode": "HTML"}
+        r = SESSION.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            logging.warning("Telegram error-send failed: %s %s", r.status_code, r.text[:200])
+    except Exception as e:
+        logging.warning("Telegram error-send exception: %s", e)
+
 # ------------------------------
 # Positions CSV helpers
 # ------------------------------
@@ -923,6 +947,37 @@ def matrix_by_exchange(matrix_path: str, exchanges: List[str]) -> Dict[str, List
         syms = df.loc[df[ex].astype(bool), "symbol"].dropna().astype(str).str.upper().unique().tolist()
         out[ex] = sorted(syms)
     return out
+
+def bybit_signed(method: str, path: str, params: dict) -> dict:
+    api_key = getenv_str("BYBIT_API_KEY", "")
+    api_secret = getenv_str("BYBIT_API_SECRET", "")
+    recv_window = "5000"
+    ts = str(int(time.time() * 1000))
+    sign_type = "2"
+
+    if method.upper() == "GET":
+        param_str = "&".join([f"{k}={params[k]}" for k in sorted(params)]) if params else ""
+        to_sign = ts + api_key + recv_window + param_str
+    else:  # POST: подписываем JSON-тело
+        body = json.dumps(params or {}, separators=(',', ':'), ensure_ascii=False)
+        to_sign = ts + api_key + recv_window + body
+
+    signature = hmac.new(
+        api_secret.encode("utf-8"),
+        to_sign.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-SIGN-TYPE": sign_type,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    return headers
 
 # ------------------------------
 # Exchange clients (funding)
@@ -1443,21 +1498,97 @@ def binance_signed(params: dict) -> dict:
     headers = {"X-MBX-APIKEY": api_key}
     return {"params": {**params, "signature": sig}, "headers": headers}
 
-def binance_futures_order(symbol: str, side: str, qty: float, reduce_only: bool=False):
-    url = f"{binance_fapi_base()}/fapi/v1/order"
+_BINANCE_SYMBOL_META = {}
+def _binance_symbol_info(symbol: str) -> Optional[dict]:
+    global _BINANCE_SYMBOL_META
+    sym = symbol.upper()
+    if sym in _BINANCE_SYMBOL_META:
+        return _BINANCE_SYMBOL_META[sym]
+    try:
+        base = binance_fapi_base()  # именно TRADING база (учитывает BINANCE_API_TESTNET)
+        r = SESSION.get(f"{base}/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT)
+        j = r.json()
+        for s in j.get("symbols", []):
+            _BINANCE_SYMBOL_META[s["symbol"]] = s
+        return _BINANCE_SYMBOL_META.get(sym)
+    except Exception as e:
+        logging.warning("Binance exchangeInfo error: %s", e)
+        return None
+
+def _binance_lot_filters(symbol: str) -> dict:
+    info = _binance_symbol_info(symbol) or {}
+    out = {"stepSize": None, "minQty": None, "minNotional": None}
+    for f in info.get("filters", []):
+        if f.get("filterType") == "LOT_SIZE":
+            out["stepSize"] = float(f.get("stepSize", "0"))
+            out["minQty"] = float(f.get("minQty", "0"))
+        if f.get("filterType") in ("MARKET_LOT_SIZE",) and not out["stepSize"]:
+            out["stepSize"] = float(f.get("stepSize", "0"))  # на всякий
+        if f.get("filterType") == "MIN_NOTIONAL":
+            out["minNotional"] = float(f.get("notional", f.get("minNotional", "0")))
+    return out
+
+def _quantize_down(x: float, step: float) -> float:
+    if not step or step <= 0: return float(x)
+    return math.floor(float(x)/float(step)) * float(step)
+
+def _adjust_binance_qty(symbol: str, qty: float, price: float = None) -> float:
+    flt = _binance_lot_filters(symbol)
+    q = float(qty)
+    if flt["stepSize"]:
+        q = _quantize_down(q, flt["stepSize"])
+    if flt["minQty"] and q < flt["minQty"]:
+        return 0.0
+    if price and flt["minNotional"]:
+        if q * float(price) < flt["minNotional"]:
+            return 0.0
+    return round(q, 8)
+
+def binance_ensure_symbol_setup(symbol: str, lev: float = None):
+    base = binance_fapi_base()
+    if lev is None:
+        lev = float(getenv_float("PERP_LEVERAGE", 5))
+    sym = symbol.upper()
+    try:
+        # isolated (мягко, игнорируем -4046 «No need to change»)
+        params = {"symbol": sym, "marginType": "ISOLATED"}
+        r = binance_signed_post("/fapi/v1/marginType", params)
+        if r.status_code != 200 and "No need to change" not in r.text:
+            logging.info("Binance marginType note %s: %s %s", sym, r.status_code, r.text[:160])
+        # leverage
+        params = {"symbol": sym, "leverage": int(lev)}
+        r = binance_signed_post("/fapi/v1/leverage", params)
+        if r.status_code != 200:
+            maybe_send_telegram_error(f"BINANCE leverage set failed {sym}",
+                                      details=r.text)
+            logging.warning("Binance leverage set failed %s: %s %s", sym, r.status_code, r.text[:200])
+    except Exception as e:
+        maybe_send_telegram_error(f"BINANCE symbol setup exception {sym}", details=str(e))
+        logging.exception("Binance symbol setup exception %s", sym)
+
+
+def binance_futures_order(symbol: str, side: str, qty: float, reduce_only: bool = False):
+    binance_ensure_symbol_setup(symbol)
     data = {
         "symbol": symbol.upper(),
         "side": side.upper(),
         "type": "MARKET",
         "quantity": qty,
-        "reduceOnly": True if reduce_only else False,  # булево ок
+        "reduceOnly": "true" if reduce_only else "false",
+        "newOrderRespType": "RESULT",
         "recvWindow": 5000,
     }
     signed = binance_signed_post(data)
-    r = SESSION.post(url, headers=signed["headers"], data=signed["data"], timeout=REQUEST_TIMEOUT)
-    if r.status_code != 200:
-        logging.warning("Binance order err %s %s", r.status_code, r.text[:200])
-    return r.json() if r.headers.get("Content-Type","").startswith("application/json") else None
+    url = f"{binance_fapi_base()}/fapi/v1/order"
+    resp = SESSION.post(url, headers=signed["headers"], data=signed["data"], timeout=REQUEST_TIMEOUT)
+    j = {}
+    try: j = resp.json()
+    except: pass
+    if resp.status_code != 200 or ("orderId" not in (j or {})):
+        maybe_send_telegram_error(f"BINANCE order failed {side} {symbol} qty={qty}",
+                                  details=(j and json.dumps(j)) or resp.text)
+        logging.warning("Binance order failed %s %s: %s %s", symbol, side, resp.status_code, resp.text[:300])
+    return j
 
 def binance_futures_positions(symbol: str):
     signed = binance_signed_get({"symbol": symbol.upper(), "recvWindow": 5000})
@@ -1465,25 +1596,25 @@ def binance_futures_positions(symbol: str):
                     headers=signed["headers"], params=signed["params"], timeout=REQUEST_TIMEOUT)
     return r.json() if r.status_code == 200 else []
 
-def bybit_signed(params: dict) -> dict:
-    api_key = os.getenv("BYBIT_API_KEY", "")
-    api_secret = os.getenv("BYBIT_API_SECRET", "")
-    ts = str(int(time.time()*1000))
-    recv = "5000"
-    param_str = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
-    sign_str = ts + api_key + recv + param_str
-    sig = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": api_key,
-        "X-BAPI-SIGN": sig,
-        "X-BAPI-SIGN-TYPE": "2",
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv,
-        "Content-Type": "application/json",
-    }
-    return {"headers": headers, "params": params}
+def bybit_ensure_leverage(symbol: str, lev: float = None):
+    if lev is None:
+        lev = float(getenv_float("PERP_LEVERAGE", 5))
+    base = bybit_base()
+    try:
+        payload = {"category": "linear", "symbol": symbol.upper(),
+                   "buyLeverage": str(lev), "sellLeverage": str(lev)}
+        signed = bybit_signed(payload)
+        r = SESSION.post(f"{base}/v5/position/set-leverage", headers=signed["headers"], json=payload, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200 or r.json().get("retCode") != 0:
+            maybe_send_telegram_error(f"BYBIT set-leverage failed {symbol}",
+                                      details=r.text)
+            logging.warning("Bybit set-leverage %s failed: %s %s", symbol, r.status_code, r.text[:200])
+    except Exception as e:
+        maybe_send_telegram_error(f"BYBIT set-leverage exception {symbol}", details=str(e))
+        logging.exception("Bybit set-leverage exception for %s", symbol)
 
 def bybit_place_order(symbol: str, side: str, qty: float, reduce_only: bool=False):
+    bybit_ensure_leverage(symbol)
     url = f"{bybit_base()}/v5/order/create"
     params = {
         "category": "linear",
@@ -1495,10 +1626,14 @@ def bybit_place_order(symbol: str, side: str, qty: float, reduce_only: bool=Fals
         "timeInForce": "IOC"
     }
     signed = bybit_signed(params)
-    r = SESSION.post(url, headers=signed["headers"], json=params, timeout=REQUEST_TIMEOUT)
-    if r.status_code != 200:
-        logging.warning("Bybit order err %s %s", r.status_code, r.text[:200])
-    return r.json() if r.headers.get("Content-Type","").startswith("application/json") else None
+    resp = SESSION.post(url, headers=signed["headers"], json=params, timeout=REQUEST_TIMEOUT)
+    j = {}
+    try: j = resp.json()
+    except: pass
+    if resp.status_code != 200 or (j and j.get("retCode", 0) != 0):
+        maybe_send_telegram_error(f"BYBIT order failed {side} {symbol} qty={qty}",
+                                details=(j and json.dumps(j)) or resp.text)
+        logging.warning("Bybit order failed %s %s: %s %s", symbol, side, resp.status_code, resp.text[:300])
 
 def bybit_positions(symbol: str):
     params = {"category":"linear", "symbol": symbol.upper()}
@@ -1597,9 +1732,9 @@ def execute_open_perp_pair(long_ex: str, short_ex: str, symbol: str, price: floa
         logging.warning("Binance short qty normalized to 0 for %s — skip short leg", symbol)
 
     # Отправка ордеров только если qty > 0
-    if long_ex == "binance" and qty_long > 0: binance_futures_order(symbol, "BUY", qty_long, reduce_only=False)
+    if long_ex == "binance": qty_long = _adjust_binance_qty(symbol, qty_long, price=px)
     if long_ex == "bybit"   and qty_long > 0: bybit_place_order(symbol, "Buy",  qty_long, reduce_only=False)
-    if short_ex == "binance" and qty_short > 0: binance_futures_order(symbol, "SELL", qty_short, reduce_only=False)
+    if short_ex == "binance": qty_short = _adjust_binance_qty(symbol, qty_short, price=px)
     if short_ex == "bybit"   and qty_short > 0: bybit_place_order(symbol, "Sell", qty_short, reduce_only=False)
 
 def execute_close_perp_pair(long_ex: str, short_ex: str, symbol: str, price: float, per_leg_notional_usd: float):
