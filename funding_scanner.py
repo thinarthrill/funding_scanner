@@ -135,6 +135,21 @@ for noisy in ("urllib3", "requests.packages.urllib3", "google"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.getLogger(noisy).propagate = False
 
+import math
+
+def _is_pos_finite(x) -> bool:
+    try:
+        xx = float(x)
+        return math.isfinite(xx) and xx > 0.0
+    except Exception:
+        return False
+
+# заменяем существующую
+def _quantize_down(x: float, step: float) -> float:
+    if not _is_pos_finite(step):
+        return x
+    return math.floor(float(x) / float(step)) * float(step)
+
 # ------------------------------
 # HTTP helper with retries + debug
 # ------------------------------
@@ -1496,6 +1511,13 @@ def _qty_from_notional(price: float, notional: float) -> float:
     return round(float(notional)/float(price), 6)
 
 def _binance_lot_filters(symbol: str) -> tuple[float|None, float|None]:
+    def _read_info(base_url: str):
+        r = SESSION.get(f"{base_url}/fapi/v1/exchangeInfo", timeout=REQUEST_TIMEOUT)
+        return r.json() if r.status_code == 200 else {}
+    info = _read_info(binance_fapi_base())
+    # если на тестнете символа нет — фоллбек на прод
+    if not info or not any(s.get("symbol")==symbol.upper() for s in info.get("symbols", [])):
+        info = _read_info(binance_fapi_base_data())
     """
     Возвращает (stepSize, minQty) для UM-фьючерса символа.
     """
@@ -1516,6 +1538,11 @@ def _binance_lot_filters(symbol: str) -> tuple[float|None, float|None]:
                             mn   = float(f.get("minQty"))  if f.get("minQty")  is not None else mn
                         except Exception:
                             pass
+                    if not _is_pos_finite(step):
+                        step = None
+                        if not _is_pos_finite(mn):
+                            mn = None
+                        return step, mn
                 return step, mn
     except Exception:
         pass
