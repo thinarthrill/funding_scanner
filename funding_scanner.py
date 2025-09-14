@@ -29,6 +29,7 @@ import hmac, hashlib, time
 from typing import Dict, Any, List, Optional, Set, Any as AnyT
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from html import escape
 load_dotenv()  # подгрузить .env
 
 import certifi
@@ -2316,7 +2317,8 @@ def main():
                 msg = (f"✅ <b>Funding CLOSE</b>\n"
                        f"{ex.upper()} {sym}\n"
                        f"APR: {cr['apr_pct']}% | 8h: {round((cr['rate_8h'] or 0)*100,6)}%\n"
-                       f"Dir: {dir_}\nReason: {reason}")
+                       f"Dir: {escape(str(dir_), quote=False)}\n"
+                       f"Reason: {escape(str(reason), quote=False)}")
                 maybe_send_telegram(msg)
                 to_remove_idx.append(i)
 
