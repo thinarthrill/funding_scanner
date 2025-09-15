@@ -948,36 +948,26 @@ def matrix_by_exchange(matrix_path: str, exchanges: List[str]) -> Dict[str, List
         out[ex] = sorted(syms)
     return out
 
-def bybit_signed(method: str, path: str, params: dict) -> dict:
+def bybit_signed(params: dict) -> dict:
     api_key = getenv_str("BYBIT_API_KEY", "")
     api_secret = getenv_str("BYBIT_API_SECRET", "")
     recv_window = "5000"
     ts = str(int(time.time() * 1000))
-    sign_type = "2"
-
-    if method.upper() == "GET":
-        param_str = "&".join([f"{k}={params[k]}" for k in sorted(params)]) if params else ""
-        to_sign = ts + api_key + recv_window + param_str
-    else:  # POST: подписываем JSON-тело
-        body = json.dumps(params or {}, separators=(',', ':'), ensure_ascii=False)
-        to_sign = ts + api_key + recv_window + body
-
-    signature = hmac.new(
-        api_secret.encode("utf-8"),
-        to_sign.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-
-    headers = {
-        "X-BAPI-API-KEY": api_key,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "X-BAPI-SIGN": signature,
-        "X-BAPI-SIGN-TYPE": sign_type,
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
+    # SignType=2: для GET — querystring, для POST — JSON body. Мы подписываем тело.
+    body = json.dumps(params or {}, separators=(',', ':'), ensure_ascii=False)
+    to_sign = ts + api_key + recv_window + body
+    signature = hmac.new(api_secret.encode("utf-8"), to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {
+        "headers": {
+            "X-BAPI-API-KEY": api_key,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-SIGN-TYPE": "2",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        }
     }
-    return headers
 
 # ------------------------------
 # Exchange clients (funding)
@@ -1552,12 +1542,16 @@ def binance_ensure_symbol_setup(symbol: str, lev: float = None):
     try:
         # isolated (мягко, игнорируем -4046 «No need to change»)
         params = {"symbol": sym, "marginType": "ISOLATED"}
-        r = binance_signed_post("/fapi/v1/marginType", params)
+        signed = binance_signed_post(params)
+        r = SESSION.post(f"{binance_fapi_base()}/fapi/v1/marginType",
+                        headers=signed["headers"], data=signed["data"], timeout=REQUEST_TIMEOUT)
         if r.status_code != 200 and "No need to change" not in r.text:
             logging.info("Binance marginType note %s: %s %s", sym, r.status_code, r.text[:160])
         # leverage
         params = {"symbol": sym, "leverage": int(lev)}
-        r = binance_signed_post("/fapi/v1/leverage", params)
+        signed = binance_signed_post(params)
+        r = SESSION.post(f"{binance_fapi_base()}/fapi/v1/leverage",
+                        headers=signed["headers"], data=signed["data"], timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
             maybe_send_telegram_error(f"BINANCE leverage set failed {sym}",
                                       details=r.text)
