@@ -948,26 +948,53 @@ def matrix_by_exchange(matrix_path: str, exchanges: List[str]) -> Dict[str, List
         out[ex] = sorted(syms)
     return out
 
-def bybit_signed(params: dict) -> dict:
-    api_key = getenv_str("BYBIT_API_KEY", "")
+def _bybit_ts() -> str:
+    return str(int(time.time() * 1000))
+
+def bybit_signed_post(payload: dict, recv_window: str = "5000") -> dict:
+    """
+    SignType=2 (POST): подписываем ровно JSON-строку, которую отправим в тело.
+    Возвращаем headers и data=body (строка).
+    """
+    api_key    = getenv_str("BYBIT_API_KEY", "")
     api_secret = getenv_str("BYBIT_API_SECRET", "")
-    recv_window = "5000"
-    ts = str(int(time.time() * 1000))
-    # SignType=2: для GET — querystring, для POST — JSON body. Мы подписываем тело.
-    body = json.dumps(params or {}, separators=(',', ':'), ensure_ascii=False)
-    to_sign = ts + api_key + recv_window + body
-    signature = hmac.new(api_secret.encode("utf-8"), to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-    return {
-        "headers": {
-            "X-BAPI-API-KEY": api_key,
-            "X-BAPI-TIMESTAMP": ts,
-            "X-BAPI-RECV-WINDOW": recv_window,
-            "X-BAPI-SIGN": signature,
-            "X-BAPI-SIGN-TYPE": "2",
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
-        }
+    ts   = _bybit_ts()
+    body = json.dumps(payload or {}, separators=(',', ':'), ensure_ascii=False)
+    origin = f"{ts}{api_key}{recv_window}{body}"
+    sign   = hmac.new(api_secret.encode(), origin.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-SIGN-TYPE": "2",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
     }
+    return {"headers": headers, "data": body}
+
+def bybit_signed_get(params: dict, recv_window: str = "5000") -> dict:
+    """
+    SignType=2 (GET): подписываем ровно querystring, который пойдёт в URL.
+    Возвращаем headers и qs (строка без ведущего '?').
+    """
+    from urllib.parse import urlencode
+    api_key    = getenv_str("BYBIT_API_KEY", "")
+    api_secret = getenv_str("BYBIT_API_SECRET", "")
+    ts = _bybit_ts()
+    qs = urlencode(params or {}, doseq=True)
+    origin = f"{ts}{api_key}{recv_window}{qs}"
+    sign   = hmac.new(api_secret.encode(), origin.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-SIGN-TYPE": "2",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    return {"headers": headers, "qs": qs}
 
 # ------------------------------
 # Exchange clients (funding)
@@ -988,13 +1015,13 @@ def bybit_get_fee(symbol: str, default_fee: float = 0.0006) -> dict:
             return None
     def _req(params: dict) -> dict | None:
         try:
-            signed = bybit_signed(params)
+            signed = bybit_signed_get(params)
         except Exception as e:
             logging.warning("Bybit fee sign error: %s", e); return None
         try:
-            r = SESSION.get(f"{bybit_base()}/v5/account/fee-rate",
-                            headers=signed["headers"], params=params,
-                            timeout=REQUEST_TIMEOUT)
+            url = f"{bybit_base()}/v5/account/fee-rate"
+            r = SESSION.get(url + ("?" + signed["qs"] if signed["qs"] else ""),
+                            headers=signed["headers"], timeout=REQUEST_TIMEOUT)
             if r.status_code != 200:
                 logging.warning("Bybit fee HTTP %s: %s", r.status_code, r.text[:200])
                 return None
@@ -1006,7 +1033,7 @@ def bybit_get_fee(symbol: str, default_fee: float = 0.0006) -> dict:
     j = _req({"category": "linear", "symbol": symbol_up})
     fees = _parse_fee_payload(j or {}) if j else None
     if not fees:
-        j2 = _req({"category":"linear"})
+        j2 = _req({"category": "linear", "settleCoin": getenv_str("BYBIT_SETTLE", "USDT")})
         fees = _parse_fee_payload(j2 or {}) if j2 else None
     if not fees:
         logging.warning("Bybit fee fallback for %s: using default maker=taker=%.6f", symbol_up, default_fee)
@@ -1522,17 +1549,55 @@ def _quantize_down(x: float, step: float) -> float:
     if not step or step <= 0: return float(x)
     return math.floor(float(x)/float(step)) * float(step)
 
+def _binance_lot_filters_unified(symbol: str) -> dict:
+    try:
+        flt = _binance_lot_filters(symbol)  # may be dict-based or tuple-based
+    except Exception:
+        flt = None
+    if isinstance(flt, tuple):
+        step, mn = (flt + (None,))[:2] if isinstance(flt, tuple) else (None, None)
+        return {"stepSize": step, "minQty": mn, "minNotional": None}
+    if isinstance(flt, dict):
+        return {
+            "stepSize": flt.get("stepSize"),
+            "minQty": flt.get("minQty"),
+            "minNotional": flt.get("minNotional"),
+        }
+    return {"stepSize": None, "minQty": None, "minNotional": None}
+
 def _adjust_binance_qty(symbol: str, qty: float, price: float = None) -> float:
-    flt = _binance_lot_filters(symbol)
-    q = float(qty)
-    if flt["stepSize"]:
-        q = _quantize_down(q, flt["stepSize"])
-    if flt["minQty"] and q < flt["minQty"]:
-        return 0.0
-    if price and flt["minNotional"]:
-        if q * float(price) < flt["minNotional"]:
+    """Normalize quantity to Binance UM futures filters (stepSize, minQty, minNotional).
+    Works no matter which version of _binance_lot_filters was defined earlier.
+    """
+    flt = _binance_lot_filters_unified(symbol)
+    q = float(qty or 0.0)
+
+    step = flt.get("stepSize")
+    try:
+        if step and float(step) > 0:
+            q = _quantize_down(q, float(step))
+            q = float(("{:.10f}".format(q)).rstrip("0").rstrip(".")) if q != 0 else 0.0
+    except Exception:
+        pass
+
+    mn = flt.get("minQty")
+    try:
+        if mn and float(mn) > 0 and q < float(mn):
             return 0.0
-    return round(q, 8)
+    except Exception:
+        pass
+
+    mnot = flt.get("minNotional")
+    try:
+        if price and mnot and float(mnot) > 0 and (q * float(price) < float(mnot)):
+            return 0.0
+    except Exception:
+        pass
+
+    try:
+        return round(float(q), 8)
+    except Exception:
+        return float(q)
 
 def binance_ensure_symbol_setup(symbol: str, lev: float = None):
     base = binance_fapi_base()
@@ -1597,8 +1662,9 @@ def bybit_ensure_leverage(symbol: str, lev: float = None):
     try:
         payload = {"category": "linear", "symbol": symbol.upper(),
                    "buyLeverage": str(lev), "sellLeverage": str(lev)}
-        signed = bybit_signed(payload)
-        r = SESSION.post(f"{base}/v5/position/set-leverage", headers=signed["headers"], json=payload, timeout=REQUEST_TIMEOUT)
+        signed = bybit_signed_post(payload)
+        r = SESSION.post(f"{base}/v5/position/set-leverage",
+                         headers=signed["headers"], data=signed["data"], timeout=REQUEST_TIMEOUT)
         if r.status_code != 200 or r.json().get("retCode") != 0:
             maybe_send_telegram_error(f"BYBIT set-leverage failed {symbol}",
                                       details=r.text)
@@ -1616,11 +1682,11 @@ def bybit_place_order(symbol: str, side: str, qty: float, reduce_only: bool=Fals
         "side": side.upper(),
         "orderType": "Market",
         "qty": str(qty),
-        "reduceOnly": reduce_only,
+        "reduceOnly": bool(reduce_only),
         "timeInForce": "IOC"
     }
-    signed = bybit_signed(params)
-    resp = SESSION.post(url, headers=signed["headers"], json=params, timeout=REQUEST_TIMEOUT)
+    signed = bybit_signed_post(params)
+    resp = SESSION.post(url, headers=signed["headers"], data=signed["data"], timeout=REQUEST_TIMEOUT)
     j = {}
     try: j = resp.json()
     except: pass
@@ -1630,9 +1696,11 @@ def bybit_place_order(symbol: str, side: str, qty: float, reduce_only: bool=Fals
         logging.warning("Bybit order failed %s %s: %s %s", symbol, side, resp.status_code, resp.text[:300])
 
 def bybit_positions(symbol: str):
-    params = {"category":"linear", "symbol": symbol.upper()}
-    signed = bybit_signed(params)
-    r = SESSION.get(f"{bybit_base()}/v5/position/list", headers=signed["headers"], params=params, timeout=REQUEST_TIMEOUT)
+    params = {"category": "linear", "symbol": symbol.upper()}
+    signed = bybit_signed_get(params)
+    url = f"{bybit_base()}/v5/position/list"
+    r = SESSION.get(url + ("?" + signed["qs"] if signed["qs"] else ""),
+                    headers=signed["headers"], timeout=REQUEST_TIMEOUT)
     return r.json() if r.status_code == 200 else {}
 
 def _qty_from_notional(price: float, notional: float) -> float:
@@ -1685,19 +1753,6 @@ def _quantize_down(x: float, step: float) -> float:
     except Exception:
         return x
 
-def _adjust_binance_qty(symbol: str, qty: float) -> float:
-    """
-    Приводит qty к шагу и минимуму лота Binance (UM futures).
-    """
-    step, mn = _binance_lot_filters(symbol)
-    if step:
-        qty = _quantize_down(qty, step)
-        # Из-за плавающей точки округлим до разумного числа знаков
-        qty = float(("{:.10f}".format(qty)).rstrip("0").rstrip(".")) if qty != 0 else 0.0
-    if mn and qty < mn:
-        return 0.0
-    return qty
-
 def execute_open_perp_pair(long_ex: str, short_ex: str, symbol: str, price: float, per_leg_notional_usd: float):
     # Если цена не пришла — попробуем добрать markPrice из биржи
     px = price
@@ -1715,9 +1770,9 @@ def execute_open_perp_pair(long_ex: str, short_ex: str, symbol: str, price: floa
     # Приведение qty к требованиям биржи
     qty_long, qty_short = qty, qty
     if long_ex == "binance":
-        qty_long = _adjust_binance_qty(symbol, qty_long)
+        qty_long = _adjust_binance_qty(symbol, qty_long, px)
     if short_ex == "binance":
-        qty_short = _adjust_binance_qty(symbol, qty_short)
+        qty_short = _adjust_binance_qty(symbol, qty_short, px)
 
     # Проверки на нулевые количества после нормализации
     if long_ex == "binance" and qty_long <= 0:
@@ -1726,9 +1781,9 @@ def execute_open_perp_pair(long_ex: str, short_ex: str, symbol: str, price: floa
         logging.warning("Binance short qty normalized to 0 for %s — skip short leg", symbol)
 
     # Отправка ордеров только если qty > 0
-    if long_ex == "binance": qty_long = _adjust_binance_qty(symbol, qty_long, price=px)
-    if long_ex == "bybit"   and qty_long > 0: bybit_place_order(symbol, "Buy",  qty_long, reduce_only=False)
-    if short_ex == "binance": qty_short = _adjust_binance_qty(symbol, qty_short, price=px)
+    if long_ex == "binance"  and qty_long > 0: qty_long = _adjust_binance_qty(symbol, qty_long, price=px)
+    if long_ex == "bybit"    and qty_long > 0: bybit_place_order(symbol, "Buy",  qty_long, reduce_only=False)
+    if short_ex == "binance" and qty_short > 0: qty_short = _adjust_binance_qty(symbol, qty_short, price=px)
     if short_ex == "bybit"   and qty_short > 0: bybit_place_order(symbol, "Sell", qty_short, reduce_only=False)
 
 def execute_close_perp_pair(long_ex: str, short_ex: str, symbol: str, price: float, per_leg_notional_usd: float):
@@ -1746,9 +1801,9 @@ def execute_close_perp_pair(long_ex: str, short_ex: str, symbol: str, price: flo
     qty = _qty_from_notional(px, per_leg_notional_usd)
     qty_long, qty_short = qty, qty
     if long_ex == "binance":
-        qty_long = _adjust_binance_qty(symbol, qty_long)
+        qty_long = _adjust_binance_qty(symbol, qty_long, px)
     if short_ex == "binance":
-        qty_short = _adjust_binance_qty(symbol, qty_short)
+        qty_short = _adjust_binance_qty(symbol, qty_short, px)
 
     if long_ex == "binance" and qty_long > 0: binance_futures_order(symbol, "SELL", qty_long, reduce_only=True)
     if long_ex == "bybit"   and qty_long > 0: bybit_place_order(symbol, "Sell",  qty_long, reduce_only=True)
@@ -2140,7 +2195,9 @@ def positions_open_close_loop(
     # открыть новую
     if best_row is not None and not df_raw.empty:
         apr_combo_pct = float(best_row["apr_combo"]) * 100.0
-        if apr_combo_pct >= float(entry_apr_threshold):
+        # Не входим, если чистая прибыль отрицательна (и/или за горизонт)
+        net_ok = float(best_row.get("net_day_usd", 0.0)) > 0.0 and float(best_row.get("net_usd", 0.0)) > 0.0
+        if apr_combo_pct >= float(entry_apr_threshold) and net_ok:
             long_ex  = str(best_row["long_ex"])
             short_ex = str(best_row["short_ex"])
             sym      = str(best_row["symbol"]).upper()
