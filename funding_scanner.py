@@ -1066,6 +1066,75 @@ def _fmt_val(v):
         return s if s else "0"
     return str(v)
 
+def binance_position_info(symbol: str) -> dict:
+    """
+    Сводка по позиции на BINANCE USDT-M Futures:
+      -> {"side": "LONG"/"SHORT", "size": float, "entryPrice": float}
+    Если позиции нет — {}.
+    """
+    try:
+        sym_u = (symbol or "").upper()
+        signed = binance_signed_get({"symbol": sym_u, "recvWindow": 5000})
+        url = f"{binance_fapi_base()}/fapi/v2/positionRisk"
+        r = SESSION.get(url, headers=signed["headers"], params=signed["params"], timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            logging.warning("[BINANCE] positionRisk %s -> %s %s", sym_u, r.status_code, r.text[:200])
+            return {}
+        rows = r.json() or []
+        rec = None
+        for rr in rows:
+            if (rr.get("symbol") or "").upper() == sym_u:
+                rec = rr; break
+        if not rec:
+            return {}
+        amt = float(rec.get("positionAmt") or 0.0)
+        if abs(amt) <= 0.0:
+            return {}
+        entry = float(rec.get("entryPrice") or 0.0)
+        side = "LONG" if amt > 0 else "SHORT"
+        return {"side": side, "size": abs(amt), "entryPrice": entry}
+    except Exception:
+        logging.exception("[BINANCE] positionRisk exception")
+        return {}
+
+def bybit_positions(symbol: str) -> dict:
+    """
+    Сводка по позиции на BYBIT (linear USDT-perp):
+      -> {"side": "LONG"/"SHORT", "size": float, "entryPrice": float}
+    Если позиции нет — {}.
+    """
+    try:
+        sym_u = (symbol or "").upper()
+        params = {"category": "linear", "symbol": sym_u}
+        signed = bybit_signed_get(params)
+        url = f"{bybit_base()}/v5/position/list"
+        r = SESSION.get(
+            url + ("?" + signed["qs"] if signed.get("qs") else ""),
+            headers=signed["headers"],
+            timeout=REQUEST_TIMEOUT
+        )
+        if r.status_code != 200:
+            logging.warning("[BYBIT] position/list %s %s", r.status_code, r.text[:200])
+            return {}
+        j = r.json() or {}
+        if j.get("retCode", 0) != 0:
+            logging.warning("[BYBIT] position/list retCode=%s %s", j.get("retCode"), str(j)[:300])
+            return {}
+        lst = (j.get("result") or {}).get("list") or []
+        if not lst:
+            return {}
+        # На unified/linear часто две строки (Buy/Sell) — берём ту, где size > 0
+        for it in lst:
+            size = float(it.get("size") or 0.0)
+            if size > 0:
+                side = "LONG" if (it.get("side") == "Buy") else "SHORT"
+                entry = float(it.get("avgPrice") or 0.0)
+                return {"side": side, "size": size, "entryPrice": entry}
+        return {}
+    except Exception:
+        logging.exception("[BYBIT] position/list exception")
+        return {}
+
 from urllib.parse import urlencode
 
 def binance_signed_get(params: dict) -> dict:
@@ -1679,22 +1748,30 @@ def bybit_place_order(symbol: str, side: str, qty: float, reduce_only: bool=Fals
     params = {
         "category": "linear",
         "symbol": symbol.upper(),
-        "side": side.upper(),
+        "side": side.capitalize(),  # "Buy"/"Sell" для v5
         "orderType": "Market",
         "qty": str(qty),
         "reduceOnly": bool(reduce_only),
-        "timeInForce": "IOC"
+        "timeInForce": "IOC",
     }
+    logging.info(f"[BYBIT] place {params['side']} {symbol} qty={qty} reduceOnly={reduce_only}")
     signed = bybit_signed_post(params)
     resp = SESSION.post(url, headers=signed["headers"], data=signed["data"], timeout=REQUEST_TIMEOUT)
     j = {}
-    try: j = resp.json()
-    except: pass
+    try:
+        j = resp.json()
+    except Exception:
+        logging.exception("[BYBIT] invalid JSON response")
+
     if resp.status_code != 200 or (j and j.get("retCode", 0) != 0):
-        maybe_send_telegram_error(f"BYBIT order failed {side} {symbol} qty={qty}",
-                                details=(j and json.dumps(j)) or resp.text)
+        maybe_send_telegram_error(
+            f"BYBIT order failed {side} {symbol} qty={qty}",
+            details=(j and json.dumps(j)) or resp.text
+        )
         logging.warning("Bybit order failed %s %s: %s %s", symbol, side, resp.status_code, resp.text[:300])
-    return j
+    else:
+        logging.info(f"[BYBIT] ok retCode=0 orderId={j.get('result', {}).get('orderId')}")
+    return j  # <-- ВАЖНО: теперь возвращаем ответ
 
 def bybit_positions(symbol: str):
     params = {"category": "linear", "symbol": symbol.upper()}
@@ -1755,7 +1832,7 @@ def _quantize_down(x: float, step: float) -> float:
         return x
 
 def execute_open_perp_pair(long_ex: str, short_ex: str, symbol: str, price: float, per_leg_notional_usd: float):
-    # Если цена не пришла — попробуем добрать markPrice из биржи
+    # 1) Цена (если не пришла — тянем mark price)
     px = price
     if (px is None or px <= 0):
         if long_ex == "binance" or short_ex == "binance":
@@ -1767,34 +1844,42 @@ def execute_open_perp_pair(long_ex: str, short_ex: str, symbol: str, price: floa
         logging.warning("Skip open: no mark price for %s (long=%s short=%s)", symbol, long_ex, short_ex)
         return False, False
 
+    # 2) Кол-во из нотионала + приведение под шаг/минимумы
     qty = _qty_from_notional(px, per_leg_notional_usd)
-    # Приведение qty к требованиям биржи
     qty_long, qty_short = qty, qty
     if long_ex == "binance":
         qty_long = _adjust_binance_qty(symbol, qty_long, px)
     if short_ex == "binance":
         qty_short = _adjust_binance_qty(symbol, qty_short, px)
 
-    # Проверки на нулевые количества после нормализации
     if long_ex == "binance" and qty_long <= 0:
         logging.warning("Binance long qty normalized to 0 for %s — skip long leg", symbol)
     if short_ex == "binance" and qty_short <= 0:
         logging.warning("Binance short qty normalized to 0 for %s — skip short leg", symbol)
 
-    # Отправка ордеров только если qty > 0 + возврат флагов успеха
+    # 3) Отправляем ордера и собираем результат
     ok_long = ok_short = False
+
     if long_ex == "binance" and qty_long > 0:
+        logging.info(f"[BINANCE] place BUY {symbol} qty={qty_long} reduceOnly=False")
         res = binance_futures_order(symbol, "BUY", qty_long, reduce_only=False)
         ok_long = bool(res and res.get("orderId"))
+
     if long_ex == "bybit" and qty_long > 0:
+        logging.info(f"[BYBIT] place Buy {symbol} qty={qty_long} reduceOnly=False")
         res = bybit_place_order(symbol, "Buy", qty_long, reduce_only=False)
         ok_long = bool(res and res.get("retCode") == 0) or ok_long
+
     if short_ex == "binance" and qty_short > 0:
+        logging.info(f"[BINANCE] place SELL {symbol} qty={qty_short} reduceOnly=False")
         res = binance_futures_order(symbol, "SELL", qty_short, reduce_only=False)
         ok_short = bool(res and res.get("orderId"))
+
     if short_ex == "bybit" and qty_short > 0:
+        logging.info(f"[BYBIT] place Sell {symbol} qty={qty_short} reduceOnly=False")
         res = bybit_place_order(symbol, "Sell", qty_short, reduce_only=False)
         ok_short = bool(res and res.get("retCode") == 0) or ok_short
+
     return ok_long, ok_short
 
 def execute_close_perp_pair(long_ex: str, short_ex: str, symbol: str, price: float, per_leg_notional_usd: float):
@@ -2236,37 +2321,50 @@ def positions_open_close_loop(
                 }
                 from pandas import concat
                 df_pos = concat([df_pos, pd.DataFrame([new])], ignore_index=True)
-                ok_long = ok_short = True
-                if not paper:
-                    px = float(best_row.get("entry_price") or 0.0)
-                    if px <= 0.0:
-                        try:
-                            px = float(df_raw[(df_raw["exchange"]==long_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
-                        except Exception:
-                            px = None
-                    ok_long, ok_short = execute_open_perp_pair(long_ex, short_ex, sym, px or 0.0, per_leg_notional_usd)
-                    try: verify_testnet_positions(sym)
-                    except Exception as _e: logging.debug("verify positions (open) err: %s", _e)
+                ok_long, ok_short = execute_open_perp_pair(long_ex, short_ex, sym, px or 0.0, per_leg_notional_usd)
 
-                msg = (
-                    f"🚀 <b>Opened</b> {sym}\n"
-                    f"{_anchor_symbol(long_ex, sym, 'perp')} / {_anchor_symbol(short_ex, sym, 'perp')}\n"
-                    f"Combo APR: {float(best_row['apr_combo'])*100:.2f}% | Size: ${per_leg_notional_usd:,.2f} per leg\n\n"
-                    f"<b>Profit/day (net):</b> ${float(best_row.get('net_day_usd', 0.0)):.2f}\n"
-                    f"  • Funding/day: ${float(best_row.get('funding_day_usd', 0.0)):.2f}\n"
-                    f"  • Fees/day: ${float(best_row.get('fees_day_usd', 0.0)):.2f}\n"
-                    f"<b>Expected ({int(best_row['exp_hours'])}h):</b> "
-                    f"${float(best_row.get('net_usd', 0.0)):.2f} after fees"
-                )
-                # Сообщаем только по факту (или если PAPER=1)
-                if paper or (ok_long and ok_short):
-                    messages.append(msg)
-                else:
-                    maybe_send_telegram_error(
-                        f"OPEN FAILED {sym} on {long_ex.upper()}/{short_ex.upper()}",
-                        details=f"qty_long={qty_long} qty_short={qty_short}"
+                if not paper:
+                    try:
+                        pos_b = {}
+                        pos_y = {}
+                        if long_ex == "binance" or short_ex == "binance":
+                            pos_b = binance_position_info(sym)
+                        if long_ex == "bybit" or short_ex == "bybit":
+                            pos_y = bybit_positions(sym)
+
+                        logging.info(f"[VERIFY OPEN] {sym} binance={bool(pos_b)} bybit={bool(pos_y)}")
+                        # Если хотя бы одна нога должна была открыться, но на бирже пусто — шлём ошибку
+                        if long_ex == "binance" and ok_long and not pos_b:
+                            maybe_send_telegram_error(f"OPEN VERIFY: no BINANCE position for {sym}")
+                        if long_ex == "bybit" and ok_long and not pos_y:
+                            maybe_send_telegram_error(f"OPEN VERIFY: no BYBIT position for {sym}")
+                        if short_ex == "binance" and ok_short and not pos_b:
+                            maybe_send_telegram_error(f"OPEN VERIFY: no BINANCE position for {sym}")
+                        if short_ex == "bybit" and ok_short and not pos_y:
+                            maybe_send_telegram_error(f"OPEN VERIFY: no BYBIT position for {sym}")
+                    except Exception:
+                        logging.exception("verify positions (open) exception")
+
+                    # Сообщение об открытии собираем заранее (для “paper” и реального трейда одинаковый вид)
+                    msg = (
+                        f"🚀 <b>Opened</b> {sym}\n"
+                        f"{_anchor_symbol(long_ex, sym, 'perp')} / {_anchor_symbol(short_ex, sym, 'perp')}\n"
+                        f"Combo APR: {float(best_row['apr_combo'])*100:.2f}% | Size: ${per_leg_notional_usd:,.2f} per leg\n\n"
+                        f"<b>Profit/day (net):</b> ${float(best_row.get('net_day_usd', 0.0)):.2f}\n"
+                        f"  • Funding/day: ${float(best_row.get('funding_day_usd', 0.0)):.2f}\n"
+                        f"  • Fees/day: ${float(best_row.get('fees_day_usd', 0.0)):.2f}\n"
+                        f"<b>Expected ({int(best_row['exp_hours'])}h):</b> "
+                        f"${float(best_row.get('net_usd', 0.0)):.2f} after fees"
                     )
 
+                    # Сообщаем строго по факту.
+                    if paper or (ok_long and ok_short):
+                        messages.append(msg)
+                    else:
+                        maybe_send_telegram_error(
+                            f"OPEN FAILED {sym} on {long_ex.upper()}/{short_ex.upper()}",
+                            details=f"long_ok={ok_long} short_ok={ok_short}"
+                        )
 
     save_positions_df(pos_path, df_pos)
     return messages
