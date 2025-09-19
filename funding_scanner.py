@@ -2321,6 +2321,19 @@ def positions_open_close_loop(
                 }
                 from pandas import concat
                 df_pos = concat([df_pos, pd.DataFrame([new])], ignore_index=True)
+
+                px_long  = None
+                px_short = None
+                try:
+                    px_long  = float(df_raw[(df_raw["exchange"]==long_ex) & (df_raw["symbol"]==sym)].iloc[0]["price"])
+                except Exception:
+                    pass
+                try:
+                    px_short = float(df_raw[(df_raw["exchange"]==short_ex) & (df_raw["symbol"]==sym)].iloc[0]["price"])
+                except Exception:
+                    pass
+                px = px_long or px_short
+
                 ok_long, ok_short = execute_open_perp_pair(long_ex, short_ex, sym, px or 0.0, per_leg_notional_usd)
 
                 if not paper:
