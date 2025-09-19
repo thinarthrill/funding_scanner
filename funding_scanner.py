@@ -1694,6 +1694,7 @@ def bybit_place_order(symbol: str, side: str, qty: float, reduce_only: bool=Fals
         maybe_send_telegram_error(f"BYBIT order failed {side} {symbol} qty={qty}",
                                 details=(j and json.dumps(j)) or resp.text)
         logging.warning("Bybit order failed %s %s: %s %s", symbol, side, resp.status_code, resp.text[:300])
+    return j
 
 def bybit_positions(symbol: str):
     params = {"category": "linear", "symbol": symbol.upper()}
@@ -1764,7 +1765,7 @@ def execute_open_perp_pair(long_ex: str, short_ex: str, symbol: str, price: floa
             px = fetch_bybit_mark_price(symbol) or px
     if px is None or px <= 0:
         logging.warning("Skip open: no mark price for %s (long=%s short=%s)", symbol, long_ex, short_ex)
-        return
+        return False, False
 
     qty = _qty_from_notional(px, per_leg_notional_usd)
     # Приведение qty к требованиям биржи
@@ -1780,11 +1781,21 @@ def execute_open_perp_pair(long_ex: str, short_ex: str, symbol: str, price: floa
     if short_ex == "binance" and qty_short <= 0:
         logging.warning("Binance short qty normalized to 0 for %s — skip short leg", symbol)
 
-    # Отправка ордеров только если qty > 0
-    if long_ex == "binance"  and qty_long > 0: qty_long = _adjust_binance_qty(symbol, qty_long, price=px)
-    if long_ex == "bybit"    and qty_long > 0: bybit_place_order(symbol, "Buy",  qty_long, reduce_only=False)
-    if short_ex == "binance" and qty_short > 0: qty_short = _adjust_binance_qty(symbol, qty_short, price=px)
-    if short_ex == "bybit"   and qty_short > 0: bybit_place_order(symbol, "Sell", qty_short, reduce_only=False)
+    # Отправка ордеров только если qty > 0 + возврат флагов успеха
+    ok_long = ok_short = False
+    if long_ex == "binance" and qty_long > 0:
+        res = binance_futures_order(symbol, "BUY", qty_long, reduce_only=False)
+        ok_long = bool(res and res.get("orderId"))
+    if long_ex == "bybit" and qty_long > 0:
+        res = bybit_place_order(symbol, "Buy", qty_long, reduce_only=False)
+        ok_long = bool(res and res.get("retCode") == 0) or ok_long
+    if short_ex == "binance" and qty_short > 0:
+        res = binance_futures_order(symbol, "SELL", qty_short, reduce_only=False)
+        ok_short = bool(res and res.get("orderId"))
+    if short_ex == "bybit" and qty_short > 0:
+        res = bybit_place_order(symbol, "Sell", qty_short, reduce_only=False)
+        ok_short = bool(res and res.get("retCode") == 0) or ok_short
+    return ok_long, ok_short
 
 def execute_close_perp_pair(long_ex: str, short_ex: str, symbol: str, price: float, per_leg_notional_usd: float):
     px = price
@@ -2225,6 +2236,7 @@ def positions_open_close_loop(
                 }
                 from pandas import concat
                 df_pos = concat([df_pos, pd.DataFrame([new])], ignore_index=True)
+                ok_long = ok_short = True
                 if not paper:
                     px = float(best_row.get("entry_price") or 0.0)
                     if px <= 0.0:
@@ -2232,7 +2244,7 @@ def positions_open_close_loop(
                             px = float(df_raw[(df_raw["exchange"]==long_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
                         except Exception:
                             px = None
-                    execute_open_perp_pair(long_ex, short_ex, sym, px or 0.0, per_leg_notional_usd)
+                    ok_long, ok_short = execute_open_perp_pair(long_ex, short_ex, sym, px or 0.0, per_leg_notional_usd)
                     try: verify_testnet_positions(sym)
                     except Exception as _e: logging.debug("verify positions (open) err: %s", _e)
 
@@ -2246,7 +2258,15 @@ def positions_open_close_loop(
                     f"<b>Expected ({int(best_row['exp_hours'])}h):</b> "
                     f"${float(best_row.get('net_usd', 0.0)):.2f} after fees"
                 )
-                messages.append(msg)
+                # Сообщаем только по факту (или если PAPER=1)
+                if paper or (ok_long and ok_short):
+                    messages.append(msg)
+                else:
+                    maybe_send_telegram_error(
+                        f"OPEN FAILED {sym} on {long_ex.upper()}/{short_ex.upper()}",
+                        details=f"qty_long={qty_long} qty_short={qty_short}"
+                    )
+
 
     save_positions_df(pos_path, df_pos)
     return messages
