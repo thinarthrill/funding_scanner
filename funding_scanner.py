@@ -642,7 +642,7 @@ def bybit_base() -> str:
     return "https://api-testnet.bybit.com" if getenv_bool("BYBIT_TESTNET", False) else "https://api.bybit.com"
 
 def binance_fapi_base() -> str:
-    return "https://testnet.binancefuture.com" if getenv_bool("BINANCE_API_TESTNET", False) else "https://fapi.binance.com"
+    return "https://demo-fapi.binance.com" if getenv_bool("BINANCE_API_TESTNET", False) else "https://fapi.binance.com"
 
 def bybit_base_data() -> str:
     """
