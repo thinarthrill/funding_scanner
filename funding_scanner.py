@@ -2335,7 +2335,21 @@ def positions_open_close_loop(
 
                 ok_long, ok_short = execute_open_perp_pair(long_ex, short_ex, sym, px, per_leg_notional_usd)
 
-                if not paper:
+                # Сообщение об открытии собираем ВСЕГДА
+                msg = (
+                    f"🚀 <b>Opened</b> {sym}\n"
+                    f"{_anchor_symbol(long_ex, sym, 'perp')} / {_anchor_symbol(short_ex, sym, 'perp')}\n"
+                    f"Combo APR: {float(best_row['apr_combo'])*100:.2f}% | Size: ${per_leg_notional_usd:,2f} per leg\n\n"
+                    f"<b>Profit/day (net):</b> ${float(best_row.get('net_day_usd', 0.0)):.2f}\n"
+                    f"  • Funding/day: ${float(best_row.get('funding_day_usd', 0.0)):.2f}\n"
+                    f"  • Fees/day: ${float(best_row.get('fees_day_usd', 0.0)):.2f}\n"
+                    f"<b>Expected ({int(best_row['exp_hours'])}h):</b> ${float(best_row.get('net_usd', 0.0)):.2f} after fees"
+                )
+
+                if paper:
+                    # В paper-режиме просто показываем событие (без verify), чтобы вы видели, что логика сработала
+                    messages.append(msg)
+                else:
                     try:
                         pos_b = {}
                         pos_y = {}
@@ -2343,9 +2357,8 @@ def positions_open_close_loop(
                             pos_b = binance_position_info(sym)
                         if long_ex == "bybit" or short_ex == "bybit":
                             pos_y = bybit_positions(sym)
-
                         logging.info(f"[VERIFY OPEN] {sym} binance={bool(pos_b)} bybit={bool(pos_y)}")
-                        # Если хотя бы одна нога должна была открыться, но на бирже пусто — шлём ошибку
+                        # Если какая-то нога должна была открыться, но на бирже пусто — шлём ошибку
                         if long_ex == "binance" and ok_long and not pos_b:
                             maybe_send_telegram_error(f"OPEN VERIFY: no BINANCE position for {sym}")
                         if long_ex == "bybit" and ok_long and not pos_y:
@@ -2357,20 +2370,7 @@ def positions_open_close_loop(
                     except Exception:
                         logging.exception("verify positions (open) exception")
 
-                    # Сообщение об открытии собираем заранее (для “paper” и реального трейда одинаковый вид)
-                    msg = (
-                        f"🚀 <b>Opened</b> {sym}\n"
-                        f"{_anchor_symbol(long_ex, sym, 'perp')} / {_anchor_symbol(short_ex, sym, 'perp')}\n"
-                        f"Combo APR: {float(best_row['apr_combo'])*100:.2f}% | Size: ${per_leg_notional_usd:,.2f} per leg\n\n"
-                        f"<b>Profit/day (net):</b> ${float(best_row.get('net_day_usd', 0.0)):.2f}\n"
-                        f"  • Funding/day: ${float(best_row.get('funding_day_usd', 0.0)):.2f}\n"
-                        f"  • Fees/day: ${float(best_row.get('fees_day_usd', 0.0)):.2f}\n"
-                        f"<b>Expected ({int(best_row['exp_hours'])}h):</b> "
-                        f"${float(best_row.get('net_usd', 0.0)):.2f} after fees"
-                    )
-
-                    # Сообщаем строго по факту.
-                    if paper or (ok_long and ok_short):
+                    if ok_long and ok_short:
                         messages.append(msg)
                     else:
                         maybe_send_telegram_error(
