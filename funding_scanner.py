@@ -67,6 +67,29 @@ def _bybit_queue_sub(symbol_up: str):
 # ------------------------------
 # ENV helpers
 # ------------------------------
+# ==== stdout tracer for exchange calls (add near other helpers) ====
+PRINT_EXCHANGE = os.getenv("PRINT_EXCHANGE", "1").lower() in ("1","true","y","yes","on")
+
+def _clip(s: str, n: int = 600) -> str:
+    s = s.replace("\n", " ")
+    return (s[:n] + "…") if len(s) > n else s
+
+def _print_exchange_io(phase: str, exchange: str, method: str, url: str,
+                       payload: dict | str | None, status: int | None, text: str | None):
+    if not PRINT_EXCHANGE:
+        return
+    try:
+        p = payload if isinstance(payload, str) else json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        p = str(payload)
+    out = [
+        f"[EX_IO] {phase} | {exchange.upper()} | {method} {url}",
+        f"  ↳ payload: {_clip(p or '-')}",
+        f"  ↳ status: {status if status is not None else '-'}",
+        f"  ↳ body:   {_clip(text or '-')}",
+    ]
+    print("\n".join(out), flush=True)
+
 def getenv_str(key: str, default: str = "") -> str:
     v = os.getenv(key)
     return default if v is None or v.strip() == "" else v.strip()
@@ -1779,6 +1802,8 @@ def bybit_positions(symbol: str):
     url = f"{bybit_base()}/v5/position/list"
     r = SESSION.get(url + ("?" + signed["qs"] if signed["qs"] else ""),
                     headers=signed["headers"], timeout=REQUEST_TIMEOUT)
+    if r.status_code != 200:
+            logging.warning("[BYBIT] position/list %s %s", r.status_code, r.text[:200]); return {}
     return r.json() if r.status_code == 200 else {}
 
 def _qty_from_notional(price: float, notional: float) -> float:
@@ -2339,7 +2364,7 @@ def positions_open_close_loop(
                 msg = (
                     f"🚀 <b>Opened</b> {sym}\n"
                     f"{_anchor_symbol(long_ex, sym, 'perp')} / {_anchor_symbol(short_ex, sym, 'perp')}\n"
-                    f"Combo APR: {float(best_row['apr_combo'])*100:.2f}% | Size: ${per_leg_notional_usd:,2f} per leg\n\n"
+                    f"Combo APR: {float(best_row['apr_combo'])*100:.2f}% | Size: ${per_leg_notional_usd:,.2f} per leg\n\n"
                     f"<b>Profit/day (net):</b> ${float(best_row.get('net_day_usd', 0.0)):.2f}\n"
                     f"  • Funding/day: ${float(best_row.get('funding_day_usd', 0.0)):.2f}\n"
                     f"  • Fees/day: ${float(best_row.get('fees_day_usd', 0.0)):.2f}\n"
@@ -2399,7 +2424,7 @@ def binance_diag():
         r = SESSION.post(f"{base}/fapi/v1/listenKey",
                          headers={"X-MBX-APIKEY": os.getenv("BINANCE_API_KEY","")},
                          timeout=REQUEST_TIMEOUT)
-        logging.info("Binance listenKey: %s %s", r.status_code, r.text[:160])
+        #logging.info("Binance listenKey: %s %s", r.status_code, r.text[:160])
     except Exception as e:
         logging.warning("Binance listenKey exception: %s", e)
 
