@@ -2498,7 +2498,18 @@ def positions_open_close_loop(
             ex_long    = str(df_pos.at[i, "long_ex"])
             ex_short   = str(df_pos.at[i, "short_ex"])
             size_usd   = float(df_pos.at[i, "size_usd"] or 0)
-            qty        = size_usd / (px_long or px_short or 1.0)  # approximate qty from size
+            # obtain latest prices to estimate quantity safely
+            px_long = None; px_short = None
+            try:
+                px_long  = float(df_raw[(df_raw["exchange"]==ex_long)&(df_raw["symbol"]==symbol)].iloc[0]["price"])
+            except Exception:
+                pass
+            try:
+                px_short = float(df_raw[(df_raw["exchange"]==ex_short)&(df_raw["symbol"]==symbol)].iloc[0]["price"])
+            except Exception:
+                pass
+            px_any = (px_long or px_short or 1.0)
+            qty        = size_usd / px_any  # approximate qty from size
             close_reason = reason  # from the logic above
 
             # закроем 2 ноги (long->SELL, short->BUY)
