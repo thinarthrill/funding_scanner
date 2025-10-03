@@ -1743,12 +1743,17 @@ def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float, 
     if ex == "binance":
         # signed order
         side_u = side.upper()
+        # extra time sync to avoid -1021
+        try:
+            binance_sync_time()
+        except Exception:
+            pass
         signed = binance_signed_post({
             "symbol": symbol.upper(),
             "side": side_u,
             "type": "MARKET",
             "quantity": qty,
-            "recvWindow": 5000
+            "recvWindow": 10000
         })
         r = SESSION.post(f"{binance_fapi_base()}/fapi/v1/order", headers=signed["headers"], data=signed["data"], timeout=REQUEST_TIMEOUT)
         j = r.json()
@@ -2549,7 +2554,14 @@ def positions_open_close_loop(
             fee_short = _taker_fee_for(short_ex, default_fee)
             exit_fees_usd = 2.0 * default_fee * size_usd  # каждая нога по рынку, 2 сделки
             df_pos.at[i, "status"]        = "closed"
-            # Ensure string columns set as strings to avoid dtype warnings
+            # Ensure target columns are object dtype to avoid pandas FutureWarning
+            try:
+                if "closed_at" in df_pos.columns and df_pos["closed_at"].dtype != object:
+                    df_pos["closed_at"] = df_pos["closed_at"].astype(object)
+                if "close_reason" in df_pos.columns and df_pos["close_reason"].dtype != object:
+                    df_pos["close_reason"] = df_pos["close_reason"].astype(object)
+            except Exception:
+                pass
             df_pos.at[i, "closed_at"]     = str(iso_utc(now_ms_val) or "")
             df_pos.at[i, "close_reason"]  = str(close_reason or "")
             df_pos.at[i, "exit_fees_usd"] = exit_fees_usd
