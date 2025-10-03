@@ -804,26 +804,29 @@ def new_attempt_id() -> str:
     return uuid.uuid4().hex[:12]
 
 def tg_event_open(attempt_id: str, symbol: str, ex_a: str, ex_b: str, side_a: str, side_b: str, qty: float, notional: float, combo_apr: float, expected_24h: float):
+    from html import escape
     maybe_send_telegram(
-        f"🚀 <b>OPEN (CROSS)</b> [{attempt_id}] {symbol}\n"
-        f"A: {ex_a} {side_a} qty={qty}\n"
-        f"B: {ex_b} {side_b} qty={qty}\n"
+        f"🚀 <b>OPEN (CROSS)</b> [{escape(str(attempt_id))}] {escape(str(symbol))}\n"
+        f"A: {escape(str(ex_a))} {escape(str(side_a))} qty={qty}\n"
+        f"B: {escape(str(ex_b))} {escape(str(side_b))} qty={qty}\n"
         f"Combo APR: {combo_apr:.2f}%  | Expected(24h): ${expected_24h:.2f}\n"
         f"Notional/leg: ${notional:.2f}"
     )
 
 def tg_event_close(attempt_id: str, symbol: str, reason: str, accrued_usd: float, exit_fees_usd: float):
+    from html import escape
     maybe_send_telegram(
-        f"✅ <b>CLOSED</b> [{attempt_id}] {symbol}\n"
-        f"Reason: {reason}\n"
+        f"✅ <b>CLOSED</b> [{escape(str(attempt_id))}] {escape(str(symbol))}\n"
+        f"Reason: {escape(str(reason))}\n"
         f"Accrued: ${accrued_usd:.2f}  | Exit fees: ${exit_fees_usd:.2f}\n"
         f"Net: ${accrued_usd - exit_fees_usd:.2f}"
     )
 
 def tg_event_rollback(attempt_id: str, symbol: str, rollback_ex: str, err: str):
+    from html import escape
     maybe_send_telegram(
-        f"🧯 <b>ROLLBACK</b> [{attempt_id}] {symbol}\n"
-        f"Rollback on {rollback_ex}. Error: {err}"
+        f"🧯 <b>ROLLBACK</b> [{escape(str(attempt_id))}] {escape(str(symbol))}\n"
+        f"Rollback on {escape(str(rollback_ex))}. Error: {escape(str(err))}"
     )
 
 # ------------------------------
@@ -2431,8 +2434,9 @@ def positions_open_close_loop(
     df_pos = load_positions_df(pos_path)
     if df_pos.empty:
         df_pos = pd.DataFrame(columns=[
-            "id","symbol","long_ex","short_ex","opened_ms","last_ms",
-            "size_usd","open_apr_combo","status","accrued_usd","open_note","held_h"
+            "id","attempt_id","symbol","long_ex","short_ex","opened_ms","last_ms","held_h",
+            "size_usd","open_apr_combo","status","accrued_usd",
+            "opened_at","closed_at","close_reason","exit_fees_usd","open_note"
         ])
 
     # Построим карту APR только если есть нужные колонки
@@ -2459,7 +2463,22 @@ def positions_open_close_loop(
         long_ex  = str(df_pos.at[i,"long_ex"])
         short_ex = str(df_pos.at[i,"short_ex"])
         sym      = str(df_pos.at[i,"symbol"]).upper()
-        last_ms  = int(df_pos.at[i,"last_ms"] or df_pos.at[i,"opened_ms"])
+        # robust NA-safe selection for timestamps (avoid boolean on pd.NA)
+        _last = df_pos.at[i, "last_ms"]
+        _opened = df_pos.at[i, "opened_ms"]
+        def _int_safe(x):
+            try:
+                if x is None:
+                    return None
+                # treat pandas NA/NaN as None
+                if (hasattr(pd, "isna") and pd.isna(x)):
+                    return None
+                return int(x)
+            except Exception:
+                return None
+        _last_i = _int_safe(_last)
+        _opened_i = _int_safe(_opened)
+        last_ms = _last_i if _last_i is not None else (_opened_i if _opened_i is not None else 0)
         _held = df_pos.at[i, "held_h"] if "held_h" in df_pos.columns else 0.0
         try:
             held_h = 0.0 if _held is None or (isinstance(_held, float) and _held != _held) else float(_held)
@@ -2530,8 +2549,9 @@ def positions_open_close_loop(
             fee_short = _taker_fee_for(short_ex, default_fee)
             exit_fees_usd = 2.0 * default_fee * size_usd  # каждая нога по рынку, 2 сделки
             df_pos.at[i, "status"]        = "closed"
-            df_pos.at[i, "closed_at"]     = iso_utc(now_ms_val)
-            df_pos.at[i, "close_reason"]  = close_reason
+            # Ensure string columns set as strings to avoid dtype warnings
+            df_pos.at[i, "closed_at"]     = str(iso_utc(now_ms_val) or "")
+            df_pos.at[i, "close_reason"]  = str(close_reason or "")
             df_pos.at[i, "exit_fees_usd"] = exit_fees_usd
             df_pos.at[i, "closed_ms"] = now_ms_val
             df_pos.at[i, "pnl_usd"] = round(float(df_pos.at[i,"accrued_usd"]) - exit_fees_usd, 4)
