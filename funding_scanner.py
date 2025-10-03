@@ -787,17 +787,57 @@ def maybe_send_telegram_error(text: str, details: Optional[str] = None) -> None:
     except Exception as e:
         logging.warning("Telegram error-send exception: %s", e)
 
+# === PATCH 1/6: utils & telegram events (INSERT BEFORE "Positions CSV helpers") ===
+import uuid
+from dataclasses import dataclass
+from typing import Optional
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+def iso_utc(ms: Optional[int]) -> Optional[str]:
+    if not ms: return None
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ms/1000, tz=timezone.utc).isoformat()
+
+def new_attempt_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+def tg_event_open(attempt_id: str, symbol: str, ex_a: str, ex_b: str, side_a: str, side_b: str, qty: float, notional: float, combo_apr: float, expected_24h: float):
+    maybe_send_telegram(
+        f"🚀 <b>OPEN (CROSS)</b> [{attempt_id}] {symbol}\n"
+        f"A: {ex_a} {side_a} qty={qty}\n"
+        f"B: {ex_b} {side_b} qty={qty}\n"
+        f"Combo APR: {combo_apr:.2f}%  | Expected(24h): ${expected_24h:.2f}\n"
+        f"Notional/leg: ${notional:.2f}"
+    )
+
+def tg_event_close(attempt_id: str, symbol: str, reason: str, accrued_usd: float, exit_fees_usd: float):
+    maybe_send_telegram(
+        f"✅ <b>CLOSED</b> [{attempt_id}] {symbol}\n"
+        f"Reason: {reason}\n"
+        f"Accrued: ${accrued_usd:.2f}  | Exit fees: ${exit_fees_usd:.2f}\n"
+        f"Net: ${accrued_usd - exit_fees_usd:.2f}"
+    )
+
+def tg_event_rollback(attempt_id: str, symbol: str, rollback_ex: str, err: str):
+    maybe_send_telegram(
+        f"🧯 <b>ROLLBACK</b> [{attempt_id}] {symbol}\n"
+        f"Rollback on {rollback_ex}. Error: {err}"
+    )
+
 # ------------------------------
 # Positions CSV helpers
 # ------------------------------
 def load_positions_df(path: str):
     import pandas as pd
+    # === PATCH 2/6: extend positions schema (REPLACE inside load_positions_df expected_cols) ===
     expected_cols = [
-        "id","symbol","long_ex","short_ex",
+        "id","attempt_id","symbol","long_ex","short_ex",
         "opened_ms","last_ms","held_h",
         "size_usd","open_apr_combo",
         "status","accrued_usd",
-        "open_note","closed_ms","pnl_usd","close_note"
+        "opened_at","closed_at","close_reason","exit_fees_usd"
     ]
     path = bucketize_path(path)
     def _empty():
@@ -832,6 +872,18 @@ def load_positions_df(path: str):
     for col in ["symbol","long_ex","short_ex","status","open_note","close_note"]:
         if col in df.columns:
             df[col] = df[col].astype(str)
+    
+    # === PATCH 2.1/6: defaults for new columns (INSERT before return in load_positions_df) ===
+    for col, default in [
+        ("attempt_id",""),
+        ("opened_at",""),
+        ("closed_at",""),
+        ("close_reason",""),
+        ("exit_fees_usd",0.0),
+    ]:
+        if col not in df.columns:
+            df[col] = default
+    
     return df
 
 def save_positions_df(path: str, df) -> None:
@@ -1624,6 +1676,168 @@ def _binance_symbol_info(symbol: str) -> Optional[dict]:
         logging.warning("Binance exchangeInfo error: %s", e)
         return None
 
+# === PATCH 3/6: order feasibility validators (INSERT AFTER _binance_symbol_info) ===
+def _round_step(value: float, step: float) -> float:
+    if not step or step <= 0: return value
+    return math.floor(value / step) * step
+
+def binance_feasible(symbol: str, qty: float, price: float) -> tuple[bool,str,float]:
+    meta = _binance_symbol_info(symbol) or {}
+    filters = {f["filterType"]: f for f in meta.get("filters", [])}
+    lot = filters.get("LOT_SIZE") or {}
+    min_qty = float(lot.get("minQty") or 0)
+    step = float(lot.get("stepSize") or 0)
+    q = _round_step(qty, step)
+    if q < min_qty:
+        return False, f"minQty {min_qty} not met (rounded {q})", q
+    notional = filters.get("MIN_NOTIONAL") or {}
+    min_not = float(notional.get("minNotional") or 0)
+    if price * q < min_not:
+        return False, f"minNotional {min_not} not met (px*qty={price*q})", q
+    return True, "ok", q
+
+_BYBIT_SYMBOL_META = {}
+def _bybit_symbol_info(symbol: str) -> Optional[dict]:
+    # public query for instrument info (USDT perp)
+    try:
+        base = "https://api-testnet.bybit.com" if os.getenv("BYBIT_API_TESTNET","false").lower()=="true" else "https://api.bybit.com"
+        r = SESSION.get(f"{base}/v5/market/instruments-info", params={"category":"linear","symbol":symbol.upper()}, timeout=REQUEST_TIMEOUT)
+        j = r.json()
+        if j.get("retCode")==0 and j.get("result",{}).get("list"):
+            info = j["result"]["list"][0]
+            _BYBIT_SYMBOL_META[symbol.upper()] = info
+            return info
+    except Exception:
+        pass
+    return _BYBIT_SYMBOL_META.get(symbol.upper())
+
+def bybit_feasible(symbol: str, qty: float, price: float) -> tuple[bool,str,float]:
+    meta = _bybit_symbol_info(symbol) or {}
+    lot_step = float((meta.get("lotSizeFilter") or {}).get("qtyStep") or 0)
+    min_qty  = float((meta.get("lotSizeFilter") or {}).get("minOrderQty") or 0)
+    q = _round_step(qty, lot_step or 1)
+    if q < min_qty:
+        return False, f"minOrderQty {min_qty} not met (rounded {q})", q
+    # notional check (if available)
+    min_notional = float((meta.get("lotSizeFilter") or {}).get("minOrderAmt") or 0)
+    if min_notional and price*q < min_notional:
+        return False, f"minOrderAmt {min_notional} not met (px*qty={price*q})", q
+    return True, "ok", q
+
+# === PATCH 4/6: atomic cross open with rollback (INSERT) ===
+def _place_perp_market_order(exchange: str, symbol: str, side: str, qty: float, paper: bool=False) -> dict:
+    """
+    Minimalistic order placer. For paper=True — returns mock as 'FILLED'.
+    For LIVE:
+      - Binance: POST /fapi/v1/order
+      - Bybit:   POST /v5/order/create
+    Returns dict with at least {"status":"FILLED","avg_price":<float>,"order_id":<str>}
+    """
+    if paper:
+        return {"status":"FILLED","avg_price":0.0,"order_id": f"paper-{uuid.uuid4().hex[:8]}"}
+
+    ex = exchange.lower()
+    if ex == "binance":
+        # signed order
+        side_u = side.upper()
+        signed = binance_signed_post({
+            "symbol": symbol.upper(),
+            "side": side_u,
+            "type": "MARKET",
+            "quantity": qty,
+            "recvWindow": 5000
+        })
+        r = SESSION.post(f"{binance_fapi_base()}/fapi/v1/order", headers=signed["headers"], data=signed["data"], timeout=REQUEST_TIMEOUT)
+        j = r.json()
+        if r.status_code==200:
+            # fetch avg price roughly from fills or mark price
+            px = 0.0
+            try:
+                px = float((j.get("fills") or [{}])[0].get("price") or 0.0)
+            except Exception:
+                pass
+            return {"status":"FILLED","avg_price":px,"order_id":str(j.get("orderId"))}
+        raise RuntimeError(f"Binance order failed: {r.status_code} {str(j)[:200]}")
+
+    if ex == "bybit":
+        base = "https://api-testnet.bybit.com" if os.getenv("BYBIT_API_TESTNET","false").lower()=="true" else "https://api.bybit.com"
+        # NOTE: You likely already have Bybit signing helpers; if not, add them later.
+        # Here we assume you implemented bybit_signed_post(params) → {"headers","params"} for v5.
+        params = {
+            "category":"linear",
+            "symbol":symbol.upper(),
+            "side":side.upper(),
+            "orderType":"Market",
+            "qty":qty,
+            "timeInForce":"IOC"
+        }
+        signed = bybit_signed_post(params)  # ← если у тебя нет — см. примечание ниже (PATCH 6/6)
+        r = SESSION.post(f"{base}/v5/order/create", headers=signed["headers"], data=signed["data"], timeout=REQUEST_TIMEOUT)
+        j = r.json()
+        if j.get("retCode")==0:
+            # average price may be in result
+            avg = 0.0
+            try:
+                avg = float((j["result"].get("avgPrice") or 0.0))
+            except Exception:
+                pass
+            return {"status":"FILLED","avg_price":avg,"order_id":j["result"].get("orderId")}
+        raise RuntimeError(f"Bybit order failed: {j}")
+
+    raise ValueError(f"Unsupported exchange for order place: {exchange}")
+
+def atomic_cross_open(symbol: str, ex_a: str, ex_b: str, side_a: str, side_b: str,
+                      qty: float, notional_usd: float, combo_apr: float, expected_24h: float,
+                      price_a: float, price_b: float, paper: bool) -> tuple[bool,str,dict]:
+    """
+    Try leg A (Bybit first by default), then leg B (Binance). If leg B fails -> rollback A.
+    Returns (ok, attempt_id, meta)
+    """
+    attempt_id = new_attempt_id()
+
+    # Pre-flight feasibility
+    okA, msgA, qA = (bybit_feasible(symbol, qty, price_a) if ex_a.lower()=="bybit" else binance_feasible(symbol, qty, price_a))
+    okB, msgB, qB = (bybit_feasible(symbol, qty, price_b) if ex_b.lower()=="bybit" else binance_feasible(symbol, qty, price_b))
+    if not okA or not okB:
+        err = f"not feasible: {ex_a}({msgA}), {ex_b}({msgB})"
+        tg_event_rollback(attempt_id, symbol, f"{ex_a}/{ex_b}", err)
+        return False, attempt_id, {"error": err}
+
+    qty_final = min(qA, qB)
+    if qty_final <= 0:
+        err = f"qty_final<=0 after rounding (qA={qA}, qB={qB})"
+        tg_event_rollback(attempt_id, symbol, f"{ex_a}/{ex_b}", err)
+        return False, attempt_id, {"error": err}
+
+    # Place A
+    try:
+        oa = _place_perp_market_order(ex_a, symbol, side_a, qty_final, paper=paper)
+        if oa.get("status") != "FILLED":
+            raise RuntimeError(f"Leg A not filled: {oa}")
+    except Exception as e:
+        tg_event_rollback(attempt_id, symbol, ex_a, f"legA error: {e}")
+        return False, attempt_id, {"error": str(e)}
+
+    # Place B
+    try:
+        ob = _place_perp_market_order(ex_b, symbol, side_b, qty_final, paper=paper)
+        if ob.get("status") != "FILLED":
+            raise RuntimeError(f"Leg B not filled: {ob}")
+    except Exception as e:
+        # rollback A
+        try:
+            # close A with opposite side
+            opp = "SELL" if side_a.upper()=="BUY" else "BUY"
+            _ = _place_perp_market_order(ex_a, symbol, opp, qty_final, paper=paper)
+        except Exception as e2:
+            tg_event_rollback(attempt_id, symbol, ex_a, f"rollback failed: {e2}")
+        tg_event_rollback(attempt_id, symbol, ex_b, f"legB error: {e}")
+        return False, attempt_id, {"error": str(e)}
+
+    # Success — notify
+    tg_event_open(attempt_id, symbol, ex_a, ex_b, side_a, side_b, qty_final, notional_usd, combo_apr, expected_24h)
+    return True, attempt_id, {"qty":qty_final,"price_a":price_a,"price_b":price_b}
+
 def _binance_lot_filters(symbol: str) -> dict:
     info = _binance_symbol_info(symbol) or {}
     out = {"stepSize": None, "minQty": None, "minNotional": None}
@@ -2212,7 +2426,7 @@ def positions_open_close_loop(
     paper: bool = True,
 ) -> list[str]:
     messages: list[str] = []
-    now_ms = _now_ms()
+    now_ms_val = now_ms()
 
     df_pos = load_positions_df(pos_path)
     if df_pos.empty:
@@ -2256,7 +2470,7 @@ def positions_open_close_loop(
         apr_short = apr_map.get((short_ex, sym), 0.0)
         apr_combo = abs(min(0.0, apr_long)) + max(0.0, apr_short)
 
-        dt_h = _hours_between(now_ms, last_ms)
+        dt_h = _hours_between(now_ms_val, last_ms)
         df_pos.at[i,"held_h"] = held_h + dt_h
 
         combo_frac = (dt_h / (24.0 * 365.0))
@@ -2267,7 +2481,7 @@ def positions_open_close_loop(
         except Exception:
             prev_acc = 0.0
         df_pos.at[i, "accrued_usd"] = prev_acc + delta_usd
-        df_pos.at[i,"last_ms"] = now_ms
+        df_pos.at[i,"last_ms"] = now_ms_val
 
         do_close = False; reason = ""
         do_close = False; reason = ""
@@ -2278,27 +2492,43 @@ def positions_open_close_loop(
             do_close = True; reason = f"MAX_HOLDING_H reached ({df_pos.at[i,'held_h']:.1f}h)"
 
         if do_close:
+            # === PATCH 5/6B: close & notify (INSERT inside branch where you close a position) ===
+            attempt_id = str(df_pos.at[i, "attempt_id"] or "")
+            symbol     = str(df_pos.at[i, "symbol"])
+            ex_long    = str(df_pos.at[i, "long_ex"])
+            ex_short   = str(df_pos.at[i, "short_ex"])
+            size_usd   = float(df_pos.at[i, "size_usd"] or 0)
+            qty        = size_usd / (px_long or px_short or 1.0)  # approximate qty from size
+            close_reason = reason  # from the logic above
+
+            # закроем 2 ноги (long->SELL, short->BUY)
             if not paper:
-                px_long  = None; px_short = None
                 try:
-                    px_long  = float(df_raw[(df_raw["exchange"]==long_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
-                except Exception: pass
-                try:
-                    px_short = float(df_raw[(df_raw["exchange"]==short_ex)&(df_raw["symbol"]==sym)].iloc[0]["price"])
-                except Exception: pass
-                px = px_long or px_short
-                execute_close_perp_pair(long_ex, short_ex, sym, px or 0.0, per_leg_notional_usd)
-                try: verify_testnet_positions(sym)
-                except Exception as _e: logging.debug("verify positions (close) err: %s", _e)
+                    if ex_long.lower() == "binance":
+                        _place_perp_market_order("binance", symbol, "SELL", qty, paper=paper)
+                    else:
+                        _place_perp_market_order("bybit",   symbol, "SELL", qty, paper=paper)
+                    if ex_short.lower() == "binance":
+                        _place_perp_market_order("binance", symbol, "BUY",  qty, paper=paper)
+                    else:
+                        _place_perp_market_order("bybit",   symbol, "BUY",  qty, paper=paper)
+                except Exception as e:
+                    logging.warning("close legs failed for %s [%s]: %s", symbol, attempt_id, e)
 
             fee_long  = _taker_fee_for(long_ex, default_fee)
             fee_short = _taker_fee_for(short_ex, default_fee)
-            exit_fees = per_leg_notional_usd * (fee_long + fee_short) * 2
-            pnl = float(df_pos.at[i,"accrued_usd"]) - exit_fees
-            df_pos.at[i,"status"] = "closed"
-            df_pos.at[i,"closed_ms"] = now_ms
-            df_pos.at[i,"pnl_usd"] = round(pnl, 4)
-            df_pos.at[i,"close_note"] = reason
+            exit_fees_usd = 2.0 * default_fee * size_usd  # каждая нога по рынку, 2 сделки
+            df_pos.at[i, "status"]        = "closed"
+            df_pos.at[i, "closed_at"]     = iso_utc(now_ms_val)
+            df_pos.at[i, "close_reason"]  = close_reason
+            df_pos.at[i, "exit_fees_usd"] = exit_fees_usd
+            df_pos.at[i, "closed_ms"] = now_ms_val
+            df_pos.at[i, "pnl_usd"] = round(float(df_pos.at[i,"accrued_usd"]) - exit_fees_usd, 4)
+            df_pos.at[i, "close_note"] = reason
+
+            # уведомление
+            accrued = float(df_pos.at[i, "accrued_usd"] or 0.0)
+            tg_event_close(attempt_id or "n/a", symbol, close_reason, accrued, exit_fees_usd)
 
             held_h = float(df_pos.at[i, "held_h"])
             avg_day = (float(df_pos.at[i,"pnl_usd"]) / max(1e-9, held_h/24.0))
@@ -2307,8 +2537,8 @@ def positions_open_close_loop(
                 f"{_anchor_symbol(long_ex, sym, 'perp')} / {_anchor_symbol(short_ex, sym, 'perp')}\n"
                 f"Held: {held_h:.1f}h | APR_now: {apr_combo*100:.2f}%\n"
                 f"Accrued: ${float(df_pos.at[i,'accrued_usd']):.2f}\n"
-                f"Exit fees: ${exit_fees:.2f}\n"
-                f"<b>PNL:</b> ${pnl:.2f} | <b>Avg/day:</b> ${avg_day:.2f}\n"
+                f"Exit fees: ${exit_fees_usd:.2f}\n"
+                f"<b>PNL:</b> ${float(df_pos.at[i,'pnl_usd']):.2f} | <b>Avg/day:</b> ${avg_day:.2f}\n"
                 f"Reason: {reason}"
             )
             messages.append(msg)
@@ -2358,7 +2588,57 @@ def positions_open_close_loop(
                     pass
                 px = px_long or px_short or 0.0
 
-                ok_long, ok_short = execute_open_perp_pair(long_ex, short_ex, sym, px, per_leg_notional_usd)
+                # === PATCH 5/6A: use atomic open (INSERT where cross-entry happens) ===
+                # assume variables prepared:
+                # symbol, ex_a, ex_b, side_a, side_b, qty, eff_notional, combo_apr, expected_24h, price_a, price_b
+                side_a = "BUY" if long_ex == "bybit" else "SELL"  # bybit long = BUY, binance long = SELL
+                side_b = "SELL" if short_ex == "bybit" else "BUY"  # bybit short = SELL, binance short = BUY
+                qty = per_leg_notional_usd / (px or 1.0)  # approximate qty from notional
+                expected_24h = float(best_row.get('net_day_usd', 0.0)) * 24.0
+                
+                ok_open, attempt_id, meta = atomic_cross_open(
+                    symbol=sym,
+                    ex_a=long_ex, ex_b=short_ex,
+                    side_a=side_a, side_b=side_b,
+                    qty=qty,
+                    notional_usd=per_leg_notional_usd,
+                    combo_apr=float(best_row["apr_combo"]),
+                    expected_24h=expected_24h,
+                    price_a=px_long or px or 0.0,
+                    price_b=px_short or px or 0.0,
+                    paper=paper
+                )
+                if ok_open:
+                    # записать позицию в POS_CROSS_PATH
+                    row = {
+                        "id": next_id,
+                        "attempt_id": attempt_id,
+                        "symbol": sym,
+                        "long_ex": long_ex,
+                        "short_ex": short_ex,
+                        "opened_ms": now_ms(),
+                        "opened_at": iso_utc(now_ms()),
+                        "last_ms": now_ms(),
+                        "held_h": 0.0,
+                        "size_usd": per_leg_notional_usd,
+                        "open_apr_combo": float(best_row["apr_combo"]),
+                        "status": "open",
+                        "accrued_usd": -entry_fees,
+                        "closed_at": "",
+                        "close_reason": "",
+                        "exit_fees_usd": 0.0
+                    }
+                    # Update the existing new dict with the new fields
+                    new.update({
+                        "attempt_id": attempt_id,
+                        "opened_at": iso_utc(now_ms()),
+                        "closed_at": "",
+                        "close_reason": "",
+                        "exit_fees_usd": 0.0
+                    })
+                else:
+                    logging.info("atomic_cross_open failed for %s: %s", sym, meta.get("error"))
+                    ok_long, ok_short = False, False
 
                 # Сообщение об открытии собираем ВСЕГДА
                 msg = (
