@@ -8,3 +8,9 @@ python-dotenv
 pandas
 google-cloud-storage
 numpy
+fsspec>=2023.0
+gcsfs>=2023.0
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
